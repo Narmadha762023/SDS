@@ -1,19 +1,28 @@
 """Bulk Upload page.
 
-Processes every matching document inside a ZIP file you upload, with no
-per-document review step -- each document is extracted (via
-extraction_pipeline.py) and saved directly, then can be spot-checked or
-corrected later from the SDS Repository page. Since there's no human
+Two ways to bring in a batch, picked via the "Upload Source" radio -- both
+feed the exact same downstream pipeline (duplicate check, extraction,
+saving), so nothing about how a file is processed depends on which one
+was used:
+
+- **ZIP file**: for a whole batch at once. Every matching file inside the
+  ZIP is processed, including ones in subfolders -- convenient when you
+  already have a folder of documents and just want all of them in.
+- **Individual files**: a normal multi-file picker, for when you only
+  want specific documents processed rather than everything in a folder.
+
+Either way, this is a normal browser file upload, not a native OS dialog
+-- chosen deliberately over a folder picker: a real browser upload works
+identically whether this app is run locally or hosted for other people
+later, with no rebuild needed either way.
+
+Each document is extracted (via extraction_pipeline.py) and saved
+directly, with no per-document review step -- spot-check or correct
+records later from the SDS Repository page. Since there's no human
 reviewing each record before it's saved here, pictogram icon detection
 still runs for every file rather than being skipped for speed -- otherwise
 bulk-saved records would be quietly less complete, with nothing catching
 the gap.
-
-Upload is a normal browser file upload (the ZIP is just one file), not a
-native OS folder dialog. This was chosen deliberately over a folder picker:
-a real browser upload works identically whether this app is run locally
-or hosted for other people later -- no rebuild needed either way. Every
-matching file inside the ZIP is processed, including ones in subfolders.
 
 Before any AI call is made, every file is checked against a SHA-256
 content hash of everything already saved (and against other files earlier
@@ -143,13 +152,101 @@ def _build_bulk_record(filename: str, file_hash: str, method: str, fields: dict,
     }
 
 
+def _collect_jobs_from_zip(extensions: set):
+    """Renders the ZIP-upload widget and, once the user clicks Start,
+    returns the list of (filename, file_bytes) jobs found inside it. This
+    is for when you have a whole batch to run -- every matching file in
+    the ZIP gets processed, no picking and choosing.
+
+    Returns None (having already rendered whatever message/error applies)
+    if there's nothing to process yet.
+    """
+    zip_upload = st.file_uploader(
+        "Upload a ZIP file of SDS documents",
+        type=["zip"],
+        key="bulk_zip_uploader",
+    )
+    if zip_upload is None:
+        st.info("Select a ZIP file to begin. (Upload limit: 200MB.)")
+        return None
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_upload.getvalue())) as zf:
+            found_entries = _list_matching_entries(zf, extensions)
+
+            if not found_entries:
+                st.warning(
+                    f"No matching files ({', '.join(sorted(extensions))}) "
+                    f"found inside this ZIP."
+                )
+                return None
+
+            st.write(f"**{len(found_entries)} file(s) found in ZIP.**")
+            with st.expander("View file list"):
+                for info in found_entries:
+                    st.write(info.filename)
+
+            if not st.button("Start Bulk Processing", type="primary"):
+                return None
+
+            if not up.OPENAI_API_KEY:
+                st.error(
+                    "OPENAI_API_KEY is not set. Add it to your .env file "
+                    "before running extraction."
+                )
+                return None
+
+            # Read every matching entry's bytes up front, on the main
+            # thread, before handing them to worker threads.
+            return [(Path(info.filename).name, zf.read(info.filename)) for info in found_entries]
+    except zipfile.BadZipFile:
+        st.error("This doesn't look like a valid ZIP file.")
+        return None
+
+
+def _collect_jobs_from_files(extensions: set):
+    """Renders a multi-file picker and, once the user clicks Start,
+    returns the list of (filename, file_bytes) jobs for just the files
+    they picked -- for when you only want specific documents processed,
+    not everything in a folder/ZIP.
+
+    Returns None (having already rendered whatever message/error applies)
+    if there's nothing to process yet.
+    """
+    uploaded_files = st.file_uploader(
+        "Select SDS documents",
+        type=sorted(ext.lstrip(".") for ext in extensions),
+        accept_multiple_files=True,
+        key="bulk_files_uploader",
+    )
+    if not uploaded_files:
+        st.info("Select one or more files to begin.")
+        return None
+
+    st.write(f"**{len(uploaded_files)} file(s) selected.**")
+    with st.expander("View file list"):
+        for f in uploaded_files:
+            st.write(f.name)
+
+    if not st.button("Start Bulk Processing", type="primary"):
+        return None
+
+    if not up.OPENAI_API_KEY:
+        st.error(
+            "OPENAI_API_KEY is not set. Add it to your .env file before "
+            "running extraction."
+        )
+        return None
+
+    return [(f.name, f.getvalue()) for f in uploaded_files]
+
+
 def render() -> None:
     st.title("Bulk Upload")
     st.caption(
-        "Upload a ZIP file containing your SDS documents. Every matching "
-        "file inside (including subfolders) is processed and saved "
-        "automatically -- no per-document review step. Spot-check or "
-        "correct individual records afterward from the SDS Repository page."
+        "Process many SDS documents at once -- automatically extracted and "
+        "saved, no per-document review step. Spot-check or correct "
+        "individual records afterward from the SDS Repository page."
     )
 
     method = st.radio(
@@ -165,46 +262,19 @@ def render() -> None:
         st.caption("Reads scanned/image-based documents using OCR.")
         extensions = OCR_EXTENSIONS
 
-    zip_upload = st.file_uploader(
-        "Upload a ZIP file of SDS documents",
-        type=["zip"],
-        key="bulk_zip_uploader",
+    source = st.radio(
+        "Upload Source",
+        ["ZIP file (a whole batch)", "Individual files (pick specific ones)"],
+        horizontal=True,
+        key="bulk_source",
     )
-    if zip_upload is None:
-        st.info("Select a ZIP file to begin. (Upload limit: 200MB.)")
-        return
 
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_upload.getvalue())) as zf:
-            found_entries = _list_matching_entries(zf, extensions)
+    if source.startswith("ZIP"):
+        jobs = _collect_jobs_from_zip(extensions)
+    else:
+        jobs = _collect_jobs_from_files(extensions)
 
-            if not found_entries:
-                st.warning(
-                    f"No matching files ({', '.join(sorted(extensions))}) "
-                    f"found inside this ZIP."
-                )
-                return
-
-            st.write(f"**{len(found_entries)} file(s) found in ZIP.**")
-            with st.expander("View file list"):
-                for info in found_entries:
-                    st.write(info.filename)
-
-            if not st.button("Start Bulk Processing", type="primary"):
-                return
-
-            if not up.OPENAI_API_KEY:
-                st.error(
-                    "OPENAI_API_KEY is not set. Add it to your .env file "
-                    "before running extraction."
-                )
-                return
-
-            # Read every matching entry's bytes up front, on the main
-            # thread, before handing them to worker threads.
-            jobs = [(Path(info.filename).name, zf.read(info.filename)) for info in found_entries]
-    except zipfile.BadZipFile:
-        st.error("This doesn't look like a valid ZIP file.")
+    if not jobs:
         return
 
     new_jobs, duplicate_jobs = _split_new_and_duplicate(jobs)

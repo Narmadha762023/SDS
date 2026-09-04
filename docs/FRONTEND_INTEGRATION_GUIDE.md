@@ -27,7 +27,11 @@ This document has two parts:
 
 ### Input
 
-One document at a time: raw file bytes + a filename + a method choice.
+Per document: raw file bytes + a filename + a method choice. The app
+accepts these either as individual files or bundled in a ZIP (every
+matching entry inside, at any depth) -- both reduce to the same list of
+`(filename, file_bytes)` pairs before anything else happens, so this
+input shape is what matters regardless of which way they arrived.
 
 ```
 file_bytes: bytes            # the raw PDF (or PNG/JPG for OCR) content
@@ -41,6 +45,12 @@ images with no text layer. Picking the wrong one either fails cleanly
 (PDF Extraction on a scanned PDF returns no text and errors out) or costs
 more than necessary (OCR on a text PDF works, but calls the vision model
 unnecessarily).
+
+Before any AI call, each file's SHA-256 content hash is checked against
+every already-saved record and against other files in the same batch --
+an exact match is treated as a duplicate and skipped before it reaches
+the AI (see `file_sha256` below). This is a content fingerprint, not a
+filename comparison.
 
 ### Output: one saved record
 
@@ -74,7 +84,10 @@ than fabricated.
   "processing_method": "PDF Extraction",
   "original_filename": "SDS - Acetone - v3.2.pdf",
   "stored_document": "e0629327-f12a-4557-8ce9-808a455d613c.pdf",
-  "saved_at": "2026-09-03T15:41:22"
+  "saved_at": "2026-09-03T15:41:22",
+  "token_usage_total": 38249,
+  "estimated_cost_usd": 0.005816,
+  "file_sha256": "b1946ac92492d2347c6235b4d2611184..."
 }
 ```
 
@@ -103,6 +116,9 @@ than fabricated.
 | `original_filename` | string | as uploaded |
 | `stored_document` | string | filename under `uploads/` -- `<id><ext>` |
 | `saved_at` | string, ISO 8601 datetime | generated on save |
+| `token_usage_total` | integer | sum of every AI call's tokens for this document (see `usage_tracker.py`) |
+| `estimated_cost_usd` | number | estimated from a fixed price table, not invoice-accurate -- see `usage_tracker.MODEL_PRICING` |
+| `file_sha256` | string, hex | SHA-256 of the original file bytes -- used for duplicate detection on future uploads |
 
 ### The underlying Python function contract
 

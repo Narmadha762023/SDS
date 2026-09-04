@@ -80,17 +80,34 @@ date, never left to the model to invent.
 
 ## Bulk Upload
 
-Zip up your SDS documents and upload that ZIP file, pick one processing
-method for the whole batch, then **Start Bulk Processing**. Every matching
-file inside the ZIP is processed, including ones in subfolders. Behind the
-scenes:
+Pick an **Upload Source**, then **Start Bulk Processing**:
 
-- This is a normal browser file upload (the ZIP is just one file) -- not
-  a native OS dialog. Chosen deliberately over a folder picker: a real
-  browser upload works identically whether this app is run locally or
-  hosted for other people later, with no rebuild needed either way.
-- Every matching entry's bytes are read out of the ZIP up front, on the
-  main thread, before any concurrent processing starts.
+- **ZIP file** -- zip up a folder of SDS documents and upload the ZIP.
+  Every matching file inside is processed, including ones in subfolders.
+  Good for a whole batch at once.
+- **Individual files** -- a normal multi-file picker, for when you only
+  want specific documents processed rather than everything in a folder.
+
+Both feed the exact same pipeline below -- nothing about how a file is
+processed depends on which one you used. Either way, this is a normal
+browser file upload, not a native OS dialog. Chosen deliberately over a
+folder picker: a real browser upload works identically whether this app
+is run locally or hosted for other people later, with no rebuild needed
+either way.
+
+Behind the scenes:
+
+- Every file's bytes are read up front, on the main thread, before any
+  concurrent processing starts.
+- **Before any AI call is made**, every file is checked against a SHA-256
+  content hash -- both of everything already saved, and of other files
+  earlier in the same batch. This is an exact-content fingerprint, not a
+  filename comparison, so a renamed copy of an already-saved document is
+  still caught (verified: uploading the same file under a different name
+  was correctly flagged), and two different documents that happen to
+  share a filename are never falsely skipped. Duplicates are logged
+  (⏭️) and skipped before they reach the AI, so no tokens are spent
+  re-processing a file that's already saved.
 - Documents are then extracted **concurrently**, a handful at a time
   (5 by default), instead of one after another -- most of the time in
   each document's AI calls is spent waiting on a network response, not
@@ -115,11 +132,9 @@ scenes:
 - **Known gaps, being upfront about them**: there's no *cap* on total
   cost for a batch (it's shown after the fact, not checked before
   starting), no retry/backoff if a call gets rate-limited (that one file
-  just fails), no duplicate-check against existing records (re-running a
-  folder after a partial failure re-saves everything, including files
-  that already succeeded, as new duplicate records), and no size limit on
-  how much gets held in memory at once -- fine for the tens of files this
-  page is built for, but worth addressing before pointing it at
+  just fails), and no size limit on how much gets held in memory at once
+  -- fine for the tens of files this page is built for, but worth
+  addressing before pointing it at
   hundreds+ files. And this is an in-page feature: if the browser tab
   closes or the connection drops mid-batch, the batch stops -- there's no
   background job that keeps running independently. A true "thousands of

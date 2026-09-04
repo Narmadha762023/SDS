@@ -15,7 +15,7 @@ separate frontend.
 | File | Responsibility |
 |---|---|
 | `app.py` | Entry point. Page config + 2-page navigation (`st.navigation`). No business logic. |
-| `bulk_upload.py` | The only upload page. Accepts a ZIP file (browser upload), runs `extraction_pipeline.py`'s functions concurrently across every matching file inside it, with no review step. |
+| `bulk_upload.py` | The only upload page. Accepts a ZIP file or individual files (both browser uploads), skips exact-content duplicates via SHA-256, runs `extraction_pipeline.py`'s functions concurrently across every new file, with no review step. |
 | `repository.py` | Reads `response/sds_records.json` and renders the search list + summary popup + PDF download. Read-only; no extraction logic. |
 | `extraction_pipeline.py` | The core pipeline: extraction orchestration, field derivation, saving. No Streamlit dependency -- plain Python, safe to call from a worker thread. `bulk_upload.py` is its only caller today. |
 | `pdf_extractor.py` | `extract_text(pdf_bytes) -> str`. Reads a PDF's real text layer via `pdfplumber`. No AI involved. |
@@ -154,14 +154,30 @@ for the fields that would normally be user-chosen (`applies_to_site`,
 per file -- there is no separate/different AI logic for a batch of many
 vs. one document. What makes it "bulk" is orchestration:
 
-- The user uploads a ZIP file via a normal `st.file_uploader` (a real
-  browser upload, not a native OS dialog -- chosen so this works the same
-  whether the app is run locally or hosted later). `bulk_upload._list_matching_entries()`
-  walks every entry in the ZIP (at any depth) matching the selected
-  method's extensions, skipping directories and `__MACOSX`/dotfile junk.
-  Every matching entry's bytes are read out of the ZIP up front, on the
-  main thread, before any concurrent processing starts.
-- `extract_and_derive()` is submitted to a `ThreadPoolExecutor` per file,
+- The user picks an **Upload Source** -- ZIP file or individual files --
+  both are normal browser uploads (never a native OS dialog, so this
+  works the same whether the app is run locally or hosted later) and
+  both end up producing the same `[(filename, file_bytes), ...]` list,
+  so everything downstream is identical regardless of which was used.
+  `bulk_upload._list_matching_entries()` walks every entry in a ZIP (at
+  any depth) matching the selected method's extensions, skipping
+  directories and `__MACOSX`/dotfile junk; for individual files,
+  `st.file_uploader(accept_multiple_files=True)` needs no such filtering
+  since its `type=` restricts selection up front. Either way, every
+  file's bytes are read up front, on the main thread, before any
+  concurrent processing starts.
+- **Before any AI call**, `bulk_upload._split_new_and_duplicate()`
+  computes a SHA-256 of each file's bytes (`extraction_pipeline.compute_file_hash()`)
+  and checks it against `extraction_pipeline.load_existing_hashes()`
+  (every already-saved record's hash) and against other files earlier in
+  the same batch. A match means an exact-content duplicate -- it's
+  logged and skipped, never reaching `extract_and_derive()`, so no
+  tokens are spent on it. This is a content fingerprint, not a filename
+  comparison: verified that a byte-identical file under a different name
+  is still caught, and that a fresh batch with only already-saved
+  content correctly finds nothing new to process.
+- `extract_and_derive()` is submitted to a `ThreadPoolExecutor` per
+  non-duplicate file,
   capped at `MAX_WORKERS = 5` concurrent workers. Since almost all the
   time in each call is spent waiting on a network response, several can
   be "in flight" together without needing more CPU.
@@ -203,3 +219,4 @@ vs. one document. What makes it "bulk" is orchestration:
 | Change which model is used | `.env` -- `OPENAI_MODEL` (field extraction) / `OPENAI_OCR_MODEL` (vision calls) |
 | Change bulk concurrency | `bulk_upload.MAX_WORKERS` |
 | Change how many pages get scanned for pictograms | `max_pages` / `max_pictogram_pages` params on `pictogram_detector.detect_pictograms()` / `ocr.extract_text_and_pictograms()` |
+| Change what counts as a duplicate | `bulk_upload._split_new_and_duplicate()` (currently: exact SHA-256 content match only -- no filename/CAS-number matching, deliberately, since either would risk false positives) |
