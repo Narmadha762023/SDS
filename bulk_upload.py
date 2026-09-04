@@ -1,13 +1,28 @@
 """Bulk Upload page.
 
-Runs the same extraction pipeline as the single-document Upload & Extract
-page, but for many files at once, with no per-document review step -- each
-document is extracted and saved directly, then can be spot-checked or
+Processes every matching document inside a ZIP file you upload, with no
+per-document review step -- each document is extracted (via
+extraction_pipeline.py) and saved directly, then can be spot-checked or
 corrected later from the SDS Repository page. Since there's no human
 reviewing each record before it's saved here, pictogram icon detection
-still runs for every file (same as single upload) rather than being
-skipped for speed -- otherwise bulk-saved records would be quietly less
-complete than single-uploaded ones, with nothing catching the gap.
+still runs for every file rather than being skipped for speed -- otherwise
+bulk-saved records would be quietly less complete, with nothing catching
+the gap.
+
+Upload is a normal browser file upload (the ZIP is just one file), not a
+native OS folder dialog. This was chosen deliberately over a folder picker:
+a real browser upload works identically whether this app is run locally
+or hosted for other people later -- no rebuild needed either way. Every
+matching file inside the ZIP is processed, including ones in subfolders.
+
+Before any AI call is made, every file is checked against a SHA-256
+content hash of everything already saved (and against other files earlier
+in the same ZIP) -- an exact-content fingerprint, not a filename
+comparison, so a renamed copy of an already-saved document is still
+caught, and two different documents that happen to share a filename are
+never falsely skipped. Duplicates are logged and skipped before they ever
+reach the AI, so re-running a batch that partly succeeded before doesn't
+burn tokens re-processing files that already made it in.
 
 Extraction for multiple documents runs concurrently, bounded to a small
 number at a time. Each document's AI calls mostly spend their time waiting
@@ -17,28 +32,82 @@ registers open at once instead of one. The concurrency cap keeps this from
 overwhelming the AI service or tripping its rate limits. Every file's saved
 document and JSON record write still happens back on the main thread, one
 at a time, so there's no risk of two threads corrupting the shared
-data/sds_records.json file by writing to it at the same moment.
+response/sds_records.json file by writing to it at the same moment.
 
-Built for batches of up to a few dozen files in one browser session. A
-true bulk import of hundreds or thousands of documents would need a
+Built for batches of up to a few dozen files in one session. Streamlit's
+default upload limit (200MB per file) also caps how large a single ZIP can
+be. A true bulk import of hundreds or thousands of documents would need a
 background job that keeps running independently of this page (so a
 browser refresh or laptop sleep doesn't lose progress), which is a bigger
 piece of infrastructure than this page provides.
 """
 
+import io
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
-import upload_page as up
+import extraction_pipeline as up
 
 MAX_WORKERS = 5
 
+PDF_EXTENSIONS = {".pdf"}
+OCR_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
 
-def _build_bulk_record(filename: str, method: str, fields: dict, derived: dict) -> dict:
+
+def _list_matching_entries(zf: zipfile.ZipFile, extensions: set) -> list:
+    """Every file entry in the zip (at any depth) whose extension matches,
+    skipping directories and macOS/system junk entries."""
+    entries = []
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename
+        if "__MACOSX" in name or Path(name).name.startswith("."):
+            continue
+        if Path(name).suffix.lower() in extensions:
+            entries.append(info)
+    entries.sort(key=lambda info: info.filename.lower())
+    return entries
+
+
+def _split_new_and_duplicate(jobs: list) -> tuple:
+    """Partition (filename, file_bytes) jobs into new vs. duplicate, using
+    a SHA-256 content hash -- both against already-saved records and
+    against earlier files in this same batch. Returns
+    (new_jobs, duplicate_jobs) where new_jobs items are
+    (filename, file_bytes, file_hash) and duplicate_jobs items are
+    (filename, reason).
+    """
+    existing_hashes = up.load_existing_hashes()
+    seen_in_batch = {}
+    new_jobs = []
+    duplicate_jobs = []
+
+    for filename, file_bytes in jobs:
+        file_hash = up.compute_file_hash(file_bytes)
+        if file_hash in existing_hashes:
+            info = existing_hashes[file_hash]
+            saved_date = info["saved_at"][:10] or "an earlier upload"
+            duplicate_jobs.append(
+                (filename, f'already saved as "{info["product_chemical_name"]}" on {saved_date}')
+            )
+        elif file_hash in seen_in_batch:
+            duplicate_jobs.append(
+                (filename, f'duplicate of "{seen_in_batch[file_hash]}" earlier in this ZIP')
+            )
+        else:
+            seen_in_batch[file_hash] = filename
+            new_jobs.append((filename, file_bytes, file_hash))
+
+    return new_jobs, duplicate_jobs
+
+
+def _build_bulk_record(filename: str, file_hash: str, method: str, fields: dict, derived: dict) -> dict:
     record_id = str(uuid.uuid4())
     return {
         "id": record_id,
@@ -68,13 +137,17 @@ def _build_bulk_record(filename: str, method: str, fields: dict, derived: dict) 
         "original_filename": filename,
         "stored_document": f"{record_id}{Path(filename).suffix}",
         "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "token_usage_total": derived["token_usage"]["total_tokens"],
+        "estimated_cost_usd": round(derived["token_usage"]["estimated_cost_usd"], 6),
+        "file_sha256": file_hash,
     }
 
 
 def render() -> None:
     st.title("Bulk Upload")
     st.caption(
-        "Upload many SDS documents at once. Each is processed and saved "
+        "Upload a ZIP file containing your SDS documents. Every matching "
+        "file inside (including subfolders) is processed and saved "
         "automatically -- no per-document review step. Spot-check or "
         "correct individual records afterward from the SDS Repository page."
     )
@@ -87,50 +160,92 @@ def render() -> None:
     )
     if method == "PDF Extraction":
         st.caption("For PDFs that already contain selectable / machine-readable text.")
-        file_types = ["pdf"]
+        extensions = PDF_EXTENSIONS
     else:
         st.caption("Reads scanned/image-based documents using OCR.")
-        file_types = ["pdf", "png", "jpg", "jpeg"]
+        extensions = OCR_EXTENSIONS
 
-    uploaded_files = st.file_uploader(
-        "Upload SDS documents",
-        type=file_types,
-        accept_multiple_files=True,
-        key="bulk_uploader",
+    zip_upload = st.file_uploader(
+        "Upload a ZIP file of SDS documents",
+        type=["zip"],
+        key="bulk_zip_uploader",
     )
-
-    if not uploaded_files:
-        st.info("Select multiple files, then click Start Bulk Processing.")
+    if zip_upload is None:
+        st.info("Select a ZIP file to begin. (Upload limit: 200MB.)")
         return
 
-    st.write(f"**{len(uploaded_files)} file(s) selected.**")
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_upload.getvalue())) as zf:
+            found_entries = _list_matching_entries(zf, extensions)
 
-    if not st.button("Start Bulk Processing", type="primary"):
+            if not found_entries:
+                st.warning(
+                    f"No matching files ({', '.join(sorted(extensions))}) "
+                    f"found inside this ZIP."
+                )
+                return
+
+            st.write(f"**{len(found_entries)} file(s) found in ZIP.**")
+            with st.expander("View file list"):
+                for info in found_entries:
+                    st.write(info.filename)
+
+            if not st.button("Start Bulk Processing", type="primary"):
+                return
+
+            if not up.OPENAI_API_KEY:
+                st.error(
+                    "OPENAI_API_KEY is not set. Add it to your .env file "
+                    "before running extraction."
+                )
+                return
+
+            # Read every matching entry's bytes up front, on the main
+            # thread, before handing them to worker threads.
+            jobs = [(Path(info.filename).name, zf.read(info.filename)) for info in found_entries]
+    except zipfile.BadZipFile:
+        st.error("This doesn't look like a valid ZIP file.")
         return
 
-    if not up.OPENAI_API_KEY:
-        st.error(
-            "OPENAI_API_KEY is not set. Add it to your .env file before "
-            "running extraction."
+    new_jobs, duplicate_jobs = _split_new_and_duplicate(jobs)
+
+    if duplicate_jobs:
+        st.warning(
+            f"{len(duplicate_jobs)} file(s) look like duplicates (already "
+            f"saved, or repeated within this ZIP) and will be skipped "
+            f"before any AI processing -- no tokens spent on them."
         )
+        with st.expander("View skipped duplicates"):
+            for filename, reason in duplicate_jobs:
+                st.write(f"⏭️ **{filename}** -- {reason}")
+
+    if not new_jobs:
+        st.info("Nothing new to process -- every matching file is a duplicate.")
         return
 
-    # Read every file's bytes up front, on the main thread -- UploadedFile
-    # objects are tied to this script run and shouldn't be touched from
-    # worker threads.
-    jobs = [(f.name, f.getvalue()) for f in uploaded_files]
+    st.write(f"**{len(new_jobs)} new file(s) will be processed.**")
 
-    progress = st.progress(0.0, text=f"0 / {len(jobs)} processed")
+    total_jobs = len(jobs)
+    progress = st.progress(0.0, text=f"0 / {total_jobs} processed")
+    usage_line = st.empty()
     log = st.container()
     saved, failed = 0, 0
+    total_tokens, total_cost = 0, 0.0
+    any_unpriced = False
+    done = 0
+
+    for filename, reason in duplicate_jobs:
+        log.write(f"⏭️ **{filename}** -- skipped, {reason}")
+        done += 1
+        progress.progress(done / total_jobs, text=f"{done} / {total_jobs} processed")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_job = {
-            executor.submit(up.extract_and_derive, method, file_bytes, filename): (filename, file_bytes)
-            for filename, file_bytes in jobs
+            executor.submit(up.extract_and_derive, method, file_bytes, filename): (filename, file_bytes, file_hash)
+            for filename, file_bytes, file_hash in new_jobs
         }
-        for i, future in enumerate(as_completed(future_to_job), start=1):
-            filename, file_bytes = future_to_job[future]
+        for future in as_completed(future_to_job):
+            filename, file_bytes, file_hash = future_to_job[future]
             error_detail = None
             try:
                 fields, derived = future.result()
@@ -142,16 +257,42 @@ def render() -> None:
                 failed += 1
                 log.write(f"❌ **{filename}** -- {error_detail or 'no text could be extracted'}")
             else:
-                record = _build_bulk_record(filename, method, fields, derived)
+                record = _build_bulk_record(filename, file_hash, method, fields, derived)
                 (up.UPLOADS_DIR / record["stored_document"]).write_bytes(file_bytes)
                 up.append_record_to_store(record)
                 saved += 1
-                log.write(f"✅ **{filename}** -> {fields['product_chemical_name'] or '(unnamed)'}")
+                usage = derived["token_usage"]
+                total_tokens += usage["total_tokens"]
+                total_cost += usage["estimated_cost_usd"]
+                any_unpriced = any_unpriced or usage["has_unpriced_calls"]
+                log.write(
+                    f"✅ **{filename}** -> {fields['product_chemical_name'] or '(unnamed)'} "
+                    f"({usage['total_tokens']:,} tokens)"
+                )
 
-            progress.progress(i / len(jobs), text=f"{i} / {len(jobs)} processed")
+            done += 1
+            progress.progress(done / total_jobs, text=f"{done} / {total_jobs} processed")
+            usage_line.caption(
+                f"Running total: {total_tokens:,} tokens -- "
+                f"~${total_cost:.4f} estimated"
+                + (" (some calls used a model not in the pricing table, so cost is a partial estimate)" if any_unpriced else "")
+            )
 
     st.divider()
+    skipped = len(duplicate_jobs)
+    summary_bits = [f"{saved} saved"]
     if failed:
-        st.warning(f"Done: {saved} saved, {failed} failed, out of {len(jobs)} total.")
+        summary_bits.append(f"{failed} failed")
+    if skipped:
+        summary_bits.append(f"{skipped} duplicate(s) skipped")
+    summary = ", ".join(summary_bits) + f", out of {total_jobs} total."
+    if failed:
+        st.warning(f"Done: {summary}")
     else:
-        st.success(f"Done: all {saved} document(s) saved successfully.")
+        st.success(f"Done: {summary}")
+    st.info(
+        f"**Total token usage: {total_tokens:,} tokens** "
+        f"(~${total_cost:.4f} estimated, at current OpenAI pricing for the "
+        f"model(s) used). This is an estimate, not an invoice-accurate "
+        f"figure -- check platform.openai.com/usage for the authoritative number."
+    )

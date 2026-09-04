@@ -1,0 +1,335 @@
+"""Shared SDS extraction pipeline.
+
+Used by bulk_upload.py (and any future caller) to turn a document's raw
+bytes into structured, saved data. No Streamlit dependency -- every
+function here is plain Python, safe to call from a worker thread.
+
+Two independent processing methods feed the same AI extraction step:
+
+  PDF Extraction:  PDF -> pdf_extractor.extract_text -> ai_extractor
+  OCR:             PDF/Image -> ocr.extract_text_and_pictograms -> ai_extractor
+
+The caller picks one -- they never run automatically or fall back into
+one another. Either way, pictogram-icon detection also runs -- SDS hazard
+pictograms are almost always graphic icons, not text, so plain text
+extraction can't see them. For PDF Extraction, that's a separate vision
+pass (pictogram_detector.py), since that pipeline never renders page
+images at all. For OCR, it's folded into the same vision call that reads
+the page's text (ocr.py), since OCR already renders and sends those
+images -- asking two separate questions about the same image in two
+separate calls would upload it twice for no reason.
+
+AI-extracted fields are returned as plain text (never a forced choice,
+since the value must reflect exactly what's in the document). Review
+Frequency and Next Review Due are pre-filled only when the document
+itself states a review cadence (e.g. "review: Every 3 Years") -- the due
+date is then computed deterministically from that stated interval plus
+the revision/issue date, never left to the model to invent.
+"""
+
+import hashlib
+import json
+import os
+import re
+from datetime import date
+from pathlib import Path
+
+from dateutil import parser as dateparser
+from dateutil.relativedelta import relativedelta
+from dotenv import load_dotenv
+
+import ai_extractor
+import ocr
+import pictogram_detector
+import pdf_extractor
+from usage_tracker import UsageTracker
+
+load_dotenv()
+
+APP_DIR = Path(__file__).parent
+UPLOADS_DIR = APP_DIR / "uploads"
+RESPONSE_DIR = APP_DIR / "response"
+RECORDS_FILE = RESPONSE_DIR / "sds_records.json"
+
+UPLOADS_DIR.mkdir(exist_ok=True)
+RESPONSE_DIR.mkdir(exist_ok=True)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OCR_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini")
+
+# GHS pictograms, in a fixed display order.
+PICTOGRAM_DEFS = [
+    {"code": "GHS02", "label": "Flammable", "icon": "🔥",
+     "synonyms": ["flame", "flammable"]},
+    {"code": "GHS03", "label": "Oxidizer", "icon": "🟠",
+     "synonyms": ["oxidiz", "flame over circle"]},
+    {"code": "GHS01", "label": "Explosive", "icon": "💥",
+     "synonyms": ["explod", "exploding bomb"]},
+    {"code": "GHS04", "label": "Gas Under Pressure", "icon": "💨",
+     "synonyms": ["gas cylinder", "gas under pressure", "compressed gas"]},
+    {"code": "GHS05", "label": "Corrosive", "icon": "🧪",
+     "synonyms": ["corrosion", "corrosive"]},
+    {"code": "GHS06", "label": "Toxic", "icon": "☠️",
+     "synonyms": ["skull", "toxic", "poison"]},
+    {"code": "GHS08", "label": "Health Hazard", "icon": "🫁",
+     "synonyms": ["health hazard", "silhouette"]},
+    {"code": "GHS07", "label": "Irritant", "icon": "❗",
+     "synonyms": ["exclamation", "irritant"]},
+    {"code": "GHS09", "label": "Environmental", "icon": "🌳",
+     "synonyms": ["environment", "aquatic", "fish"]},
+]
+
+# Official GHS Hazard Statement -> pictogram assignments (UN GHS Annex 1),
+# limited to codes commonly seen in industrial/chemical SDS documents. This
+# is a fixed regulatory lookup, applied deterministically in Python -- the
+# AI only has to extract which H-codes literally appear in the text, never
+# to apply the mapping itself.
+H_CODE_TO_PICTOGRAMS = {
+    "H200": ["GHS01"], "H201": ["GHS01"], "H202": ["GHS01"], "H203": ["GHS01"],
+    "H204": ["GHS01"], "H205": ["GHS01"],
+    "H220": ["GHS02"], "H221": ["GHS02"], "H222": ["GHS02"], "H223": ["GHS02"],
+    "H224": ["GHS02"], "H225": ["GHS02"], "H226": ["GHS02"], "H228": ["GHS02"],
+    "H240": ["GHS01"], "H241": ["GHS01", "GHS02"], "H242": ["GHS02"],
+    "H250": ["GHS02"], "H251": ["GHS02"], "H252": ["GHS02"],
+    "H260": ["GHS02"], "H261": ["GHS02"],
+    "H270": ["GHS03"], "H271": ["GHS03"], "H272": ["GHS03"],
+    "H280": ["GHS04"], "H281": ["GHS04"],
+    "H290": ["GHS05"],
+    "H300": ["GHS06"], "H301": ["GHS06"],
+    "H302": ["GHS07"],
+    "H304": ["GHS08"],
+    "H310": ["GHS06"], "H311": ["GHS06"],
+    "H312": ["GHS07"],
+    "H314": ["GHS05"],
+    "H315": ["GHS07"], "H317": ["GHS07"],
+    "H318": ["GHS05"],
+    "H319": ["GHS07"],
+    "H330": ["GHS06"], "H331": ["GHS06"],
+    "H332": ["GHS07"],
+    "H334": ["GHS08"],
+    "H335": ["GHS07"], "H336": ["GHS07"],
+    "H340": ["GHS08"], "H341": ["GHS08"],
+    "H350": ["GHS08"], "H351": ["GHS08"],
+    "H360": ["GHS08"], "H361": ["GHS08"], "H362": ["GHS08"],
+    "H370": ["GHS08"], "H371": ["GHS08"], "H372": ["GHS08"], "H373": ["GHS08"],
+    "H400": ["GHS09"], "H410": ["GHS09"], "H411": ["GHS09"],
+    "H412": ["GHS09"], "H413": ["GHS09"],
+}
+
+REVIEW_FREQUENCIES = ["Annually", "Every 2 Years", "Every 3 Years", "Custom"]
+SITE_OPTIONS = ["All Sites", "Site A", "Site B", "Site C"]
+
+
+def parse_review_interval_years(text: str):
+    """Pull a whole-number year interval out of a stated review cadence.
+
+    Only returns a value when the document's own wording clearly states an
+    interval (e.g. "Every 3 Years", "Annually"); returns None otherwise so
+    the caller never has to guess.
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    if re.search(r"\bannual", lowered) or re.search(r"\b1\s*year", lowered):
+        return 1
+    match = re.search(r"(\d+)\s*year", lowered)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def parse_version_from_filename(filename: str):
+    """Pull a version number out of the uploaded filename as a fallback.
+
+    Only used when the document text itself has no version -- many SDS
+    files are named with their version (e.g. "... - v3.0 (2023-02-15).pdf"),
+    so this reads something that's actually present, not invented.
+    """
+    if not filename:
+        return None
+    match = re.search(r"\bv(\d+(?:\.\d+)*)\b", filename, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def match_pictograms(extracted: list, hazard_codes: list = None) -> set:
+    """Map AI-returned pictogram strings and hazard statement (H-)codes onto
+    the fixed GHS01-09 codes. H-codes are resolved via the deterministic
+    H_CODE_TO_PICTOGRAMS lookup, not left to the model to interpret."""
+    selected = set()
+    for item in extracted or []:
+        text = str(item).strip().lower()
+        for pic in PICTOGRAM_DEFS:
+            terms = [pic["code"].lower(), pic["label"].lower(), *pic["synonyms"]]
+            if any(term in text for term in terms):
+                selected.add(pic["code"])
+                break
+    for code in hazard_codes or []:
+        normalized = re.sub(r"\s+", "", str(code)).upper()
+        selected.update(H_CODE_TO_PICTOGRAMS.get(normalized, []))
+    return selected
+
+
+def parse_date_safe(raw: str):
+    """Best-effort parse of an AI-extracted date string. None if unparseable."""
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        return dateparser.parse(str(raw), fuzzy=True).date()
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _detect_pictogram_icons(file_bytes: bytes, filename: str, tracker=None) -> list:
+    """Best-effort vision-based pictogram icon detection.
+
+    A failure here (network, API) should not take down the rest of an
+    otherwise-successful extraction, so it degrades to "none detected"
+    rather than raising.
+    """
+    try:
+        return pictogram_detector.detect_pictograms(
+            file_bytes, filename, OPENAI_API_KEY, OCR_MODEL, tracker=tracker
+        )
+    except Exception:
+        return []
+
+
+def compute_derived_fields(fields: dict, filename: str, detected_pictogram_codes: list) -> dict:
+    """Pure post-processing on top of the AI's raw field extraction:
+    resolving pictograms (text/H-code match + vision-detected icons), the
+    filename version fallback, date parsing, and the review-cadence
+    computation.
+    """
+    ghs_selected = match_pictograms(
+        fields["ghs_hazard_pictograms"], fields.get("hazard_statement_codes")
+    )
+    ghs_selected.update(detected_pictogram_codes)
+    ghs_labels = [
+        f"{pic['code']} - {pic['label']}"
+        for pic in PICTOGRAM_DEFS
+        if pic["code"] in ghs_selected
+    ]
+
+    version = fields["version"]
+    version_source = "document" if version else ""
+    if not version:
+        filename_version = parse_version_from_filename(filename)
+        if filename_version:
+            version = filename_version
+            version_source = "filename"
+
+    revision_date_parsed = parse_date_safe(fields["revision_date"])
+    issue_date_parsed = parse_date_safe(fields["issue_date"])
+
+    # Review Frequency / Next Review Due default to the plain baseline, then
+    # get pre-filled only if this document explicitly states a review
+    # interval.
+    review_frequency = REVIEW_FREQUENCIES[0]
+    next_review_due = date.today()
+    years = parse_review_interval_years(fields["review_frequency_stated"])
+    if years is not None:
+        review_frequency = {
+            1: "Annually", 2: "Every 2 Years", 3: "Every 3 Years",
+        }.get(years, "Custom")
+        base_date = revision_date_parsed or issue_date_parsed
+        if base_date is not None:
+            next_review_due = base_date + relativedelta(years=years)
+
+    return {
+        "ghs_selected_codes": ghs_selected,
+        "ghs_hazard_pictograms": ghs_labels,
+        "version": version,
+        "version_source": version_source,
+        "revision_date_parsed": revision_date_parsed,
+        "issue_date_parsed": issue_date_parsed,
+        "review_frequency": review_frequency,
+        "review_frequency_raw": fields["review_frequency_stated"],
+        "next_review_due": next_review_due,
+    }
+
+
+def extract_and_derive(method: str, file_bytes: bytes, filename: str):
+    """Run the full extraction pipeline for one document: text/OCR -> AI
+    fields -> pictogram icon detection -> derived fields. No Streamlit
+    calls, so this is safe to run inside a worker thread for concurrent
+    (bulk) processing. Returns (fields, derived), or (None, None) if no
+    text could be extracted.
+
+    OCR mode gets pictogram-icon detection "for free" as part of reading
+    the page images (see ocr.extract_text_and_pictograms) instead of a
+    separate pass -- PDF Extraction mode still needs its own pictogram
+    pass since it never renders page images at all.
+
+    `derived["token_usage"]` holds this document's total token usage and
+    estimated cost across every AI call made for it (field extraction +
+    whichever pictogram/OCR calls ran) -- see usage_tracker.py.
+    """
+    tracker = UsageTracker()
+
+    if method == "PDF Extraction":
+        raw_text = pdf_extractor.extract_text(file_bytes)
+        if not raw_text.strip():
+            return None, None
+        detected_pictogram_codes = _detect_pictogram_icons(file_bytes, filename, tracker)
+    else:
+        raw_text, detected_pictogram_codes = ocr.extract_text_and_pictograms(
+            file_bytes, filename, OPENAI_API_KEY, OCR_MODEL, tracker=tracker
+        )
+        if not raw_text.strip():
+            return None, None
+
+    fields = ai_extractor.extract_fields(raw_text, OPENAI_API_KEY, AI_MODEL, tracker=tracker)
+    derived = compute_derived_fields(fields, filename, detected_pictogram_codes)
+    derived["token_usage"] = tracker.summary()
+    return fields, derived
+
+
+def compute_file_hash(file_bytes: bytes) -> str:
+    """SHA-256 of the raw file bytes -- an exact-content fingerprint, not a
+    filename comparison, so a renamed copy of the same file is still
+    caught, and two different documents that happen to share a filename
+    never get falsely flagged as duplicates.
+    """
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def load_existing_records() -> list:
+    """All records currently in the store, or [] if none/unreadable."""
+    if not RECORDS_FILE.exists():
+        return []
+    try:
+        return json.loads(RECORDS_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+
+def load_existing_hashes() -> dict:
+    """Map of file_sha256 -> a short summary of the existing record that
+    hash belongs to (product name, when it was saved), for every saved
+    record that has a hash on file. Records saved before this feature was
+    added have no `file_sha256` and simply can't be matched against --
+    they're not retroactively hashed.
+    """
+    existing = {}
+    for record in load_existing_records():
+        file_hash = record.get("file_sha256")
+        if file_hash:
+            existing[file_hash] = {
+                "product_chemical_name": record.get("product_chemical_name") or "(unnamed)",
+                "saved_at": record.get("saved_at", ""),
+            }
+    return existing
+
+
+def append_record_to_store(record: dict) -> None:
+    """Append one record dict to the JSON store.
+
+    Bulk processing runs extraction concurrently across worker threads, but
+    every call to this function happens back on the main thread as each
+    result comes in -- so this read-modify-write is never racing against
+    itself.
+    """
+    records = load_existing_records()
+    records.append(record)
+    RECORDS_FILE.write_text(json.dumps(records, indent=2), encoding="utf-8")

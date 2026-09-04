@@ -1,13 +1,11 @@
 # SDS Management
 
-A Streamlit app with three pages:
+A Streamlit app with two pages:
 
-- **Upload & Extract** -- upload one Safety Data Sheet (SDS), automatically
-  extract key fields with an LLM, review/edit them, and save the record
-  together with the original document.
-- **Bulk Upload** -- upload many SDS documents at once. Same extraction
-  pipeline, run concurrently across documents, with no per-document review
-  step -- each is extracted and saved directly.
+- **Bulk Upload** -- upload many Safety Data Sheet (SDS) documents at
+  once. Each is automatically processed with an LLM (text/OCR extraction,
+  field extraction, GHS hazard pictogram detection) and saved directly --
+  no per-document review step, built for clearing a backlog fast.
 - **SDS Repository** -- a searchable list of saved SDS records built for
   quick lookup: click one to pop up a summary of the critical fields with a
   button to open the full original PDF.
@@ -21,22 +19,21 @@ this app has no HTTP API of its own, see that doc for why).
 
 ## How it works
 
-Two independent, user-selected pipelines feed the same AI extraction step.
-The user explicitly picks one -- the app never auto-switches between them.
+Two independent, user-selected processing methods feed the same AI
+extraction step. The user explicitly picks one -- the app never
+auto-switches between them.
 
 **PDF Extraction** (for PDFs with a real text layer):
 
 ```
-Upload SDS PDF -> extract text (pdfplumber) -> AI extracts fields -> form
+PDF -> extract text (pdfplumber) -> AI extracts fields
 ```
 
 **OCR** (for scanned PDFs or images):
 
 ```
-Upload SDS PDF/Image -> OCR via LLM vision -> AI extracts fields -> form
+PDF/Image -> OCR via LLM vision -> AI extracts fields
 ```
-
-OCR only runs when the user explicitly selects it.
 
 Either way, **pictogram icon detection** also runs, since SDS hazard
 pictograms are almost always graphic icons, not text -- plain text
@@ -56,47 +53,44 @@ model to apply itself.
   pages. One call now asks for both the transcribed text and the visible
   pictogram icons together.
 
-### AI-extracted fields
+### Extracted fields
 
-Kept prominent in the review form, since these are the parts a front-line
-worker needs at a glance: `Product/Chemical Name*`, `Manufacturer/Supplier`,
-`Emergency Contact Phone`, `GHS Hazard Pictograms`, `Safety Hazards
-(physical & health)`, `First Aid Measures`, `Personal Protection`,
-`Storage`.
-
-Lower-priority document metadata is extracted too but tucked into a
-collapsed "Document Details" section to keep the review quick: `CAS
-Number`, `Physical State`, `Category`, `Version`, `Revision Date`, `Issue
-Date`. `Version` falls back to parsing the uploaded filename (e.g. "... -
-v3.0 (2023-02-15).pdf") when the document text itself has no version, since
-that's a common naming convention -- the form shows a caption when this
-fallback is used.
+`Product/Chemical Name`, `Manufacturer/Supplier`, `Emergency Contact
+Phone`, `CAS Number`, `GHS Hazard Pictograms`, `Safety Hazards (physical &
+health)`, `First Aid Measures`, `Personal Protection`, `Storage`,
+`Physical State`, `Category`, `Version`, `Revision Date`, `Issue Date`.
 
 The AI is instructed to never guess -- any field not present in the
 document is left empty. `Safety Hazards` is explicitly instructed to
 include *every* hazard statement found, not a trimmed-down subset, since
 dropping one for brevity would be a real safety gap, not just a style
-choice.
+choice. `Version` falls back to parsing the uploaded filename (e.g. "... -
+v3.0 (2023-02-15).pdf") when the document text itself has no version,
+since that's a common naming convention.
 
-### Manually-selected fields (not extracted by AI)
+### Fields not extracted by AI
 
-`Applies To Site` and `Review Owners` are always user-chosen. `Review
+`Applies To Site` and `Review Owners` default to a plain baseline (`All
+Sites`, no owners) since there's no per-document review step -- correct a
+specific record from the SDS Repository page if needed. `Review
 Frequency` and `Next Review Due` are pre-filled only when the document
-states a review cadence (e.g. "review: Every 3 Years") -- the due date is
-then computed from that stated interval plus the revision/issue date, never
-left to the model to invent -- and remain fully editable either way.
+itself states a review cadence (e.g. "review: Every 3 Years") -- the due
+date is then computed from that stated interval plus the revision/issue
+date, never left to the model to invent.
 
 ## Bulk Upload
 
-For getting many documents in fast (e.g. clearing a backlog) rather than
-reviewing one at a time. Select multiple files, pick one processing method
-for the whole batch, and click **Start Bulk Processing**. Behind the
+Zip up your SDS documents and upload that ZIP file, pick one processing
+method for the whole batch, then **Start Bulk Processing**. Every matching
+file inside the ZIP is processed, including ones in subfolders. Behind the
 scenes:
 
-- Every file's bytes are read into memory up front, on the main page --
-  not because of any special caching, just because the uploaded-file
-  objects Streamlit hands back aren't safe to use from a background
-  worker, so the plain bytes are extracted first while it's safe to do so.
+- This is a normal browser file upload (the ZIP is just one file) -- not
+  a native OS dialog. Chosen deliberately over a folder picker: a real
+  browser upload works identically whether this app is run locally or
+  hosted for other people later, with no rebuild needed either way.
+- Every matching entry's bytes are read out of the ZIP up front, on the
+  main thread, before any concurrent processing starts.
 - Documents are then extracted **concurrently**, a handful at a time
   (5 by default), instead of one after another -- most of the time in
   each document's AI calls is spent waiting on a network response, not
@@ -105,32 +99,48 @@ scenes:
   The concurrency cap keeps this from overwhelming the AI service or
   tripping its rate limits.
 - Each document is saved the moment its own extraction finishes -- no
-  review form, no summary step. `Applies To Site` and `Review Owners`
-  default the same way a fresh form would; fix a specific record
-  afterward from the SDS Repository page if needed.
+  review form, no summary step.
 - Saving itself (writing the file + appending to the JSON record store)
   always happens back on the main thread, one document at a time, even
   though extraction runs in parallel -- so there's no risk of two
-  documents' writes corrupting the shared `data/sds_records.json` file.
+  documents' writes corrupting the shared `response/sds_records.json` file.
 - One failed document doesn't stop the batch; a live log shows ✅/❌ per
-  file as each one finishes, with a final saved/failed count.
-- **Known gaps, being upfront about them**: there's currently no
-  estimate or cap on total AI token/cost usage for a batch, and no size
-  limit on how much gets held in memory at once -- fine for the tens of
-  files this page is built for, but worth addressing before pointing it
-  at hundreds+ files. And this is an in-page feature: if the browser tab
+  file (with each file's token count) as it finishes, plus a running
+  token/cost total and a final summary once the batch completes. Every
+  saved record also stores its own token usage, visible later in the SDS
+  Repository summary popup. See `usage_tracker.py` -- this is an
+  *estimate* based on a fixed, manually-maintained price table (OpenAI
+  doesn't expose pricing via the API), not an invoice-accurate figure;
+  check platform.openai.com/usage for the real number.
+- **Known gaps, being upfront about them**: there's no *cap* on total
+  cost for a batch (it's shown after the fact, not checked before
+  starting), no retry/backoff if a call gets rate-limited (that one file
+  just fails), no duplicate-check against existing records (re-running a
+  folder after a partial failure re-saves everything, including files
+  that already succeeded, as new duplicate records), and no size limit on
+  how much gets held in memory at once -- fine for the tens of files this
+  page is built for, but worth addressing before pointing it at
+  hundreds+ files. And this is an in-page feature: if the browser tab
   closes or the connection drops mid-batch, the batch stops -- there's no
   background job that keeps running independently. A true "thousands of
   documents" bulk import would need that as separate infrastructure.
+
+## SDS Repository
+
+Lists every saved record with a search box (matches product name,
+manufacturer, or CAS number). Clicking **View** on a record pops up a
+summary of the critical fields (emergency contact, pictograms, hazards,
+first aid, PPE, storage, category, version, dates) plus an **Open Full
+SDS** button that downloads the original document from `uploads/`.
 
 ## Project structure
 
 ```
 sds_app/
-├── app.py                 # Entry point: page config + 3-page navigation
-├── upload_page.py         # Upload & Extract page (extraction, review form, save)
-├── bulk_upload.py         # Bulk Upload page (concurrent extraction, no review)
+├── app.py                 # Entry point: page config + 2-page navigation
+├── bulk_upload.py          # Bulk Upload page (concurrent extraction, no review)
 ├── repository.py          # SDS Repository page (search, summary popup, PDF link)
+├── extraction_pipeline.py # Shared pipeline: text/OCR -> AI fields -> derived fields -> save
 ├── pdf_extractor.py       # PDF text-layer extraction
 ├── ocr.py                 # OCR via LLM vision (transcribes text; combined with
 │                           # pictogram detection in one call per page)
@@ -138,13 +148,27 @@ sds_app/
 │                           # (used standalone for PDF Extraction mode)
 ├── image_utils.py         # Shared PDF page rasterizing (PyMuPDF)
 ├── ai_extractor.py        # LLM field-extraction (structured JSON)
+├── usage_tracker.py       # Token usage + estimated cost tracking
 ├── requirements.txt
 ├── .env                    # OPENAI_API_KEY (not committed with a real value)
 ├── docs/
 │   ├── BACKEND_AI_GUIDE.md            # Pipeline internals, step by step
 │   └── FRONTEND_INTEGRATION_GUIDE.md  # I/O data shapes + proposed API
+├── response/
+│   └── sds_records.json   # The saved-record "database" (see below)
+├── uploads/                # Copies of every saved document (see below)
 └── README.md
 ```
+
+**`uploads/` vs `response/` -- why both exist**: `uploads/` holds a
+permanent copy of each original document (renamed `<record_id><ext>`),
+which is what "Open Full SDS" serves. `response/sds_records.json` holds
+only the *extracted information about* each document -- the AI's
+structured response (product name, hazards, etc.), not the documents
+themselves -- it's the searchable index the Repository page reads. The
+`uploads/` copy matters because the source you uploaded from (a ZIP, in
+this app) isn't kept anywhere after processing -- once a batch finishes,
+`uploads/` is the *only* remaining copy of that original document.
 
 ## Setup
 
@@ -167,25 +191,6 @@ sds_app/
    ```bash
    streamlit run app.py
    ```
-
-## Saving
-
-Clicking **Save SDS**:
-
-- Validates required fields (`Product/Chemical Name`, `SDS Document`).
-- Copies the original uploaded file into `uploads/`.
-- Appends the reviewed record (including the manually-selected review
-  fields) to `data/sds_records.json`.
-- Shows a success message with the saved record ID, and the record
-  immediately appears in the SDS Repository page.
-
-## SDS Repository
-
-Lists every saved record with a search box (matches product name,
-manufacturer, or CAS number). Clicking **View** on a record pops up a
-summary of the critical fields (emergency contact, pictograms, hazards,
-first aid, PPE, storage) plus an **Open Full SDS** button that downloads
-the original document from `uploads/`.
 
 ## Notes
 

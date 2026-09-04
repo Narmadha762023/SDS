@@ -65,7 +65,7 @@ Return ONLY a JSON object of the form:
 (empty list for pictograms if none are visible)."""
 
 
-def _transcribe_image(client: OpenAI, model: str, image_bytes: bytes) -> str:
+def _transcribe_image(client: OpenAI, model: str, image_bytes: bytes, tracker=None) -> str:
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -82,10 +82,12 @@ def _transcribe_image(client: OpenAI, model: str, image_bytes: bytes) -> str:
         ],
         temperature=0,
     )
+    if tracker is not None:
+        tracker.record(response, model)
     return (response.choices[0].message.content or "").strip()
 
 
-def _transcribe_and_detect(client: OpenAI, model: str, image_bytes: bytes):
+def _transcribe_and_detect(client: OpenAI, model: str, image_bytes: bytes, tracker=None):
     """One combined vision call: transcribe the page AND look for pictogram
     icons. Returns (text, pictogram_codes)."""
     response = client.chat.completions.create(
@@ -105,6 +107,8 @@ def _transcribe_and_detect(client: OpenAI, model: str, image_bytes: bytes):
         temperature=0,
         response_format={"type": "json_object"},
     )
+    if tracker is not None:
+        tracker.record(response, model)
     content = response.choices[0].message.content or "{}"
     try:
         data = json.loads(content)
@@ -120,39 +124,13 @@ def _transcribe_and_detect(client: OpenAI, model: str, image_bytes: bytes):
     return text, codes
 
 
-def extract_text(
-    file_bytes: bytes,
-    filename: str,
-    api_key: str,
-    model: str = "gpt-4o-mini",
-) -> str:
-    """Run OCR (via LLM vision) on an uploaded PDF or image file.
-
-    Returns the transcribed text, page by page for PDFs.
-    """
-    client = OpenAI(api_key=api_key)
-    is_pdf = filename.lower().endswith(".pdf")
-
-    if is_pdf:
-        page_images = pdf_to_page_images(file_bytes)
-    else:
-        page_images = [file_bytes]
-
-    transcripts = []
-    for i, image_bytes in enumerate(page_images, start=1):
-        text = _transcribe_image(client, model, image_bytes)
-        if text:
-            transcripts.append(f"--- Page {i} ---\n{text}")
-
-    return "\n\n".join(transcripts).strip()
-
-
 def extract_text_and_pictograms(
     file_bytes: bytes,
     filename: str,
     api_key: str,
     model: str = "gpt-4o-mini",
     max_pictogram_pages: int = 3,
+    tracker=None,
 ):
     """Run OCR and pictogram-icon detection together.
 
@@ -161,7 +139,8 @@ def extract_text_and_pictograms(
     two separate calls sending the same image twice). Remaining pages are
     transcribed only, since GHS pictograms are essentially always found
     early in a standard SDS, so there's no reason to keep asking about
-    icons past that point.
+    icons past that point. `tracker`, if given a usage_tracker.UsageTracker,
+    records every call's token usage onto it.
 
     Returns (transcribed_text, pictogram_codes).
     """
@@ -174,10 +153,10 @@ def extract_text_and_pictograms(
 
     for i, image_bytes in enumerate(page_images, start=1):
         if i <= max_pictogram_pages:
-            text, codes = _transcribe_and_detect(client, model, image_bytes)
+            text, codes = _transcribe_and_detect(client, model, image_bytes, tracker)
             pictogram_codes.update(codes)
         else:
-            text = _transcribe_image(client, model, image_bytes)
+            text = _transcribe_image(client, model, image_bytes, tracker)
         if text:
             transcripts.append(f"--- Page {i} ---\n{text}")
 

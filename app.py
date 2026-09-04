@@ -1,22 +1,20 @@
 """SDS Management -- entry point.
 
-Three pages: uploading/extracting one SDS at a time with review, bulk
-uploading many at once with no review step, and a searchable repository
-for looking up ones already saved. See upload_page.py, bulk_upload.py, and
-repository.py.
+Two pages: bulk uploading many SDS documents at once (no review step), and
+a searchable repository for looking up ones already saved. See
+bulk_upload.py and repository.py. Both build on the shared pipeline in
+extraction_pipeline.py.
 """
 
 import streamlit as st
 
 import bulk_upload
 import repository
-import upload_page
 
 st.set_page_config(page_title="SDS Management", layout="wide")
 
 pages = [
-    st.Page(upload_page.render, title="Upload & Extract", icon="📤", url_path="upload", default=True),
-    st.Page(bulk_upload.render, title="Bulk Upload", icon="📦", url_path="bulk-upload"),
+    st.Page(bulk_upload.render, title="Bulk Upload", icon="📦", url_path="bulk-upload", default=True),
     st.Page(repository.render, title="SDS Repository", icon="🗂️", url_path="repository"),
 ]
 

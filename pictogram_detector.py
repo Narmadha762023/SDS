@@ -47,7 +47,7 @@ Return ONLY a JSON object of the form {{"pictograms": ["GHS02", "GHS05"]}} \
 (empty list if none)."""
 
 
-def _detect_in_image(client: OpenAI, model: str, image_bytes: bytes) -> list:
+def _detect_in_image(client: OpenAI, model: str, image_bytes: bytes, tracker=None) -> list:
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -65,6 +65,8 @@ def _detect_in_image(client: OpenAI, model: str, image_bytes: bytes) -> list:
         temperature=0,
         response_format={"type": "json_object"},
     )
+    if tracker is not None:
+        tracker.record(response, model)
     content = response.choices[0].message.content or "{}"
     try:
         data = json.loads(content)
@@ -80,9 +82,13 @@ def detect_pictograms(
     api_key: str,
     model: str = "gpt-4o-mini",
     max_pages: int = 3,
+    tracker=None,
 ) -> list:
     """Return the GHS pictogram codes (e.g. ["GHS02", "GHS05"]) visibly
-    present as icons anywhere in the first `max_pages` pages."""
+    present as icons anywhere in the first `max_pages` pages. `tracker`,
+    if given a usage_tracker.UsageTracker, records each call's token usage
+    onto it.
+    """
     client = OpenAI(api_key=api_key)
     is_pdf = filename.lower().endswith(".pdf")
 
@@ -93,6 +99,6 @@ def detect_pictograms(
 
     found = set()
     for image_bytes in page_images:
-        found.update(_detect_in_image(client, model, image_bytes))
+        found.update(_detect_in_image(client, model, image_bytes, tracker))
 
     return sorted(found)

@@ -15,7 +15,7 @@ import streamlit as st
 
 APP_DIR = Path(__file__).parent
 UPLOADS_DIR = APP_DIR / "uploads"
-RECORDS_FILE = APP_DIR / "data" / "sds_records.json"
+RECORDS_FILE = APP_DIR / "response" / "sds_records.json"
 
 SUMMARY_FIELDS = [
     ("Emergency Contact Phone", "emergency_contact_phone"),
@@ -59,6 +59,14 @@ def _show_summary(record: dict) -> None:
         st.markdown(f"**{label}**")
         st.write(value if value else "—")
 
+    st.markdown("**AI Token Usage**")
+    tokens = record.get("token_usage_total")
+    cost = record.get("estimated_cost_usd")
+    if tokens is None:
+        st.write("— (saved before token tracking was added)")
+    else:
+        st.write(f"{tokens:,} tokens (~${cost:.4f} estimated)")
+
     st.divider()
     stored_name = record.get("stored_document", "")
     doc_path = UPLOADS_DIR / stored_name if stored_name else None
@@ -84,7 +92,7 @@ def render() -> None:
 
     records = _load_records()
     if not records:
-        st.info("No SDS records saved yet. Use the Upload & Extract page to add one.")
+        st.info("No SDS records saved yet. Use the Bulk Upload page to add some.")
         return
 
     search = st.text_input(

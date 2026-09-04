@@ -100,10 +100,14 @@ SDS TEXT:
 """
 
 
-def extract_fields(sds_text: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
+def extract_fields(
+    sds_text: str, api_key: str, model: str = "gpt-4o-mini", tracker=None
+) -> dict:
     """Send extracted SDS text to the LLM and return the structured fields.
 
     On any failure, returns the empty schema rather than guessing.
+    `tracker`, if given a usage_tracker.UsageTracker, records this call's
+    token usage onto it.
     """
     if not sds_text or not sds_text.strip():
         return dict(FIELDS_SCHEMA)
@@ -122,6 +126,8 @@ def extract_fields(sds_text: str, api_key: str, model: str = "gpt-4o-mini") -> d
         temperature=0,
         response_format={"type": "json_object"},
     )
+    if tracker is not None:
+        tracker.record(response, model)
 
     content = response.choices[0].message.content or "{}"
 

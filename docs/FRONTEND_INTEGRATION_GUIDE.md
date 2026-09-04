@@ -44,7 +44,7 @@ unnecessarily).
 
 ### Output: one saved record
 
-This is the exact JSON shape written to `data/sds_records.json` and read
+This is the exact JSON shape written to `response/sds_records.json` and read
 back by the repository/search page. Every field marked "AI-extracted" can
 legitimately be `""` / `[]` -- the AI is instructed to never guess, so a
 field simply not present in the source document comes back empty rather
@@ -95,8 +95,8 @@ than fabricated.
 | `version` | string | AI-extracted, or parsed from filename as fallback |
 | `revision_date` | string, `YYYY-MM-DD` or `""` | AI-extracted, parsed |
 | `issue_date` | string, `YYYY-MM-DD` or `""` | AI-extracted, parsed |
-| `applies_to_site` | string | user-chosen (single upload) or defaulted (bulk) |
-| `review_owners` | array of strings | user-chosen (single upload) or `[]` (bulk) |
+| `applies_to_site` | string | defaulted to `"All Sites"` -- no review step sets this today |
+| `review_owners` | array of strings | defaulted to `[]` -- no review step sets this today |
 | `review_frequency` | string | AI-extracted if stated in doc, else default `"Annually"` |
 | `next_review_due` | string, `YYYY-MM-DD` | computed (`revision_date` + stated interval), else today |
 | `processing_method` | `"PDF Extraction"` \| `"OCR"` | which pipeline processed this document |
@@ -107,12 +107,12 @@ than fabricated.
 ### The underlying Python function contract
 
 If you're calling into this as a library rather than over HTTP, the
-functions to know (all in `upload_page.py`, no Streamlit dependency
-except `run_extraction`/`save_record` which read `st.session_state`):
+functions to know are all in `extraction_pipeline.py`, which has **no
+Streamlit dependency at all** -- plain Python, safe to call from any
+context (including a real API server):
 
 ```python
-# Headless -- no Streamlit dependency, safe to call from any context.
-fields, derived = upload_page.extract_and_derive(method, file_bytes, filename)
+fields, derived = extraction_pipeline.extract_and_derive(method, file_bytes, filename)
 # fields:  dict matching ai_extractor.FIELDS_SCHEMA (16 keys, see below)
 # derived: dict with ghs_selected_codes, ghs_hazard_pictograms,
 #          version, version_source, revision_date_parsed, issue_date_parsed,
@@ -148,15 +148,17 @@ fields, derived = upload_page.extract_and_derive(method, file_bytes, filename)
 ## Part 2 -- Proposed API contract (not implemented)
 
 A thin [FastAPI](https://fastapi.tiangolo.com/) service wrapping the
-existing functions would look like this. It reuses `upload_page.py`'s
+existing functions would look like this. It reuses `extraction_pipeline.py`'s
 functions directly -- no extraction logic would need to be rewritten,
 only exposed.
 
 ### `POST /api/v1/extract`
 
 Run extraction on one document **without saving it** -- for a frontend
-that wants its own review/edit UI before committing a record (mirroring
-what the current Upload & Extract Streamlit page does).
+that wants its own review/edit UI before committing a record. Nothing in
+this app builds that UI today (there's no per-document review step
+anywhere in the current app, single or bulk), so this endpoint would be
+new capability, not a wrapper around an existing page.
 
 **Request**: `multipart/form-data`
 | Field | Type | Notes |
@@ -232,7 +234,7 @@ accepting a batch. Neither exists in the current code.
 ### What this proposal deliberately doesn't solve
 
 - **Storage**: the proposed endpoints assume the same local
-  `data/sds_records.json` + `uploads/` storage as today. That's a real
+  `response/sds_records.json` + `uploads/` storage as today. That's a real
   scaling limit (see `BACKEND_AI_GUIDE.md` section 4) independent of
   whether an API layer exists -- adding an API on top of the current
   storage doesn't fix concurrency-safety or make it survive a redeploy.

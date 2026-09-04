@@ -1,1 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables
 .env
+
+# User uploads
+uploads/
+
+# Generated/local output
+response/
+
+# Local data
+data/
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
