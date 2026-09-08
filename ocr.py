@@ -6,20 +6,24 @@ module rasterizes each page (or uses the image as-is) and asks the LLM's
 vision endpoint to transcribe the visible text verbatim. No text is
 invented -- the model is instructed to transcribe only, not interpret.
 
-`extract_text_and_pictograms()` also folds in pictogram-icon detection for
-the first few pages, in the SAME vision call as the transcription --
-transcription and icon detection would otherwise send the exact same page
-image to the AI twice (once per job), so combining them halves the vision
-calls (and image-token cost) for those overlapping pages. This only applies
-here, in OCR mode: PDF Extraction mode never sends page images for
-transcription in the first place, so there's nothing to combine there --
-it still calls pictogram_detector.detect_pictograms() as its own step.
+`extract_text_and_pictograms()` tries non-AI pictogram detection first
+(template_matcher -- embedded-image match, then OpenCV region match on the
+rendered pages) since text transcription needs the page images rendered
+anyway, so trying those costs nothing extra. Only when neither finds
+anything does it fall back to asking the vision model to also look for
+pictogram icons, in the SAME call as the transcription (rather than a
+second call sending the same image again) -- combining them halves the
+vision calls for the pages where the AI fallback is actually needed. PDF
+Extraction mode never renders page images at all, so it goes through
+`extraction_pipeline._detect_pictogram_icons()`'s own three-tier logic
+instead.
 """
 
 import json
 
 from openai import OpenAI
 
+import template_matcher
 from image_utils import image_to_data_url, pdf_to_page_images
 
 TRANSCRIBE_PROMPT = (
@@ -134,13 +138,15 @@ def extract_text_and_pictograms(
 ):
     """Run OCR and pictogram-icon detection together.
 
-    For the first `max_pictogram_pages` pages, transcription and icon
-    detection happen in a single combined vision call per page (instead of
-    two separate calls sending the same image twice). Remaining pages are
-    transcribed only, since GHS pictograms are essentially always found
-    early in a standard SDS, so there's no reason to keep asking about
-    icons past that point. `tracker`, if given a usage_tracker.UsageTracker,
-    records every call's token usage onto it.
+    Pictogram detection is tried non-AI first (template_matcher), since
+    transcription already needs the page images rendered -- if that finds
+    a result, every page (including the first `max_pictogram_pages`) is
+    transcribed with the plain prompt, and the AI is never asked about
+    icons at all. Only if the non-AI tiers find nothing does the first
+    `max_pictogram_pages` fall back to the combined "transcribe + detect"
+    call, so the AI is only asked once per page either way -- never twice.
+    `tracker`, if given a usage_tracker.UsageTracker, records every call's
+    token usage onto it.
 
     Returns (transcribed_text, pictogram_codes).
     """
@@ -148,11 +154,25 @@ def extract_text_and_pictograms(
     is_pdf = filename.lower().endswith(".pdf")
     page_images = pdf_to_page_images(file_bytes) if is_pdf else [file_bytes]
 
-    transcripts = []
     pictogram_codes = set()
+    try:
+        pictogram_codes.update(
+            template_matcher.match_embedded_images(file_bytes, filename, max_pages=max_pictogram_pages)
+        )
+    except Exception:
+        pass
+    if not pictogram_codes:
+        try:
+            for image_bytes in page_images[:max_pictogram_pages]:
+                pictogram_codes.update(template_matcher.match_page_regions(image_bytes))
+        except Exception:
+            pass
 
+    need_ai_pictogram_detection = not pictogram_codes
+
+    transcripts = []
     for i, image_bytes in enumerate(page_images, start=1):
-        if i <= max_pictogram_pages:
+        if need_ai_pictogram_detection and i <= max_pictogram_pages:
             text, codes = _transcribe_and_detect(client, model, image_bytes, tracker)
             pictogram_codes.update(codes)
         else:

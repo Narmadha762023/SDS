@@ -59,14 +59,6 @@ def _show_summary(record: dict) -> None:
         st.markdown(f"**{label}**")
         st.write(value if value else "—")
 
-    st.markdown("**AI Token Usage**")
-    tokens = record.get("token_usage_total")
-    cost = record.get("estimated_cost_usd")
-    if tokens is None:
-        st.write("— (saved before token tracking was added)")
-    else:
-        st.write(f"{tokens:,} tokens (~${cost:.4f} estimated)")
-
     st.divider()
     stored_name = record.get("stored_document", "")
     doc_path = UPLOADS_DIR / stored_name if stored_name else None

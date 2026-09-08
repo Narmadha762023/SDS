@@ -42,16 +42,42 @@ hazard-statement (H-)codes found in the text -- H-codes are mapped to
 their official pictogram via a fixed Python lookup table, not left to the
 model to apply itself.
 
-- **PDF Extraction mode**: since that pipeline never renders page images,
-  pictogram detection is a separate vision pass over the first few pages
-  (`pictogram_detector.py`).
-- **OCR mode**: OCR already renders and sends those page images to read
-  the text, so pictogram detection is folded into that *same* vision call
-  instead of a second one (`ocr.extract_text_and_pictograms`) -- asking
-  two separate questions about the same image in two separate calls would
-  upload it twice for no reason, roughly doubling vision cost on those
-  pages. One call now asks for both the transcribed text and the visible
-  pictogram icons together.
+Pictogram icon detection itself is **three tiers, cheapest and most
+certain first** (`template_matcher.py`), falling back to AI only when
+needed:
+
+1. **Embedded-image template match** -- many SDS PDFs embed each
+   pictogram as its own image object rather than drawing it on the page.
+   When that's true, the image is pulled out directly (PyMuPDF) and
+   compared against the 9 official GHS icons (`pictogram_templates/`,
+   public-domain UN artwork) via perceptual-image hashing. Deterministic,
+   zero AI tokens -- either it's a confident match or it's not, never a
+   guess. A color-pattern filter (white background + thin red border)
+   rejects other diamond-shaped graphics that aren't GHS pictograms --
+   e.g. PPE icons or transport/DOT hazard labels, which use different
+   color patterns entirely.
+2. **OpenCV region match** -- for pictograms drawn directly into the page
+   instead of embedded separately: finds red-bordered diamond-shaped
+   regions on the rendered page and runs the same template match against
+   each. Still zero AI tokens.
+3. **AI vision fallback** -- only reached if both non-AI tiers find
+   nothing (e.g. a scanned page, or a rendering style neither tier
+   recognizes). This is the original approach, now a safety net rather
+   than the default:
+   - **PDF Extraction mode**: since that pipeline never renders page
+     images for any other reason, this fallback is a dedicated vision pass
+     over the first few pages (`pictogram_detector.py`).
+   - **OCR mode**: OCR already renders and sends those page images to read
+     the text, so when the AI fallback is needed, pictogram detection is
+     folded into that *same* vision call instead of a second one
+     (`ocr.extract_text_and_pictograms`) -- asking two separate questions
+     about the same image in two separate calls would upload it twice for
+     no reason.
+
+Verified against a real SDS document: tiers 1-2 found the identical result
+the AI vision call used to find (same two pictogram codes), at roughly
+8,800 tokens for the whole document instead of ~120,000 -- because the
+pictogram vision call, previously the dominant cost, didn't run at all.
 
 ### Extracted fields
 
@@ -124,8 +150,9 @@ Behind the scenes:
 - One failed document doesn't stop the batch; a live log shows ✅/❌ per
   file (with each file's token count) as it finishes, plus a running
   token/cost total and a final summary once the batch completes. Every
-  saved record also stores its own token usage, visible later in the SDS
-  Repository summary popup. See `usage_tracker.py` -- this is an
+  saved record also stores its own token usage internally (not shown in
+  the SDS Repository summary popup, since that's a content-lookup view,
+  not a processing-info view). See `usage_tracker.py` -- this is an
   *estimate* based on a fixed, manually-maintained price table (OpenAI
   doesn't expose pricing via the API), not an invoice-accurate figure;
   check platform.openai.com/usage for the real number.
@@ -157,10 +184,15 @@ sds_app/
 ├── repository.py          # SDS Repository page (search, summary popup, PDF link)
 ├── extraction_pipeline.py # Shared pipeline: text/OCR -> AI fields -> derived fields -> save
 ├── pdf_extractor.py       # PDF text-layer extraction
-├── ocr.py                 # OCR via LLM vision (transcribes text; combined with
-│                           # pictogram detection in one call per page)
-├── pictogram_detector.py  # LLM vision pass that recognizes GHS icon shapes
-│                           # (used standalone for PDF Extraction mode)
+├── ocr.py                 # OCR via LLM vision (transcribes text; falls back to
+│                           # combined text+pictogram call only if non-AI
+│                           # detection found nothing)
+├── template_matcher.py    # Non-AI GHS pictogram detection: embedded-image
+│                           # template match + OpenCV region match (tiers 1-2)
+├── pictogram_templates/   # The 9 official GHS pictogram reference images
+│                           # (public domain UN artwork) used for template matching
+├── pictogram_detector.py  # AI vision fallback (tier 3) that recognizes GHS
+│                           # icon shapes when the non-AI tiers find nothing
 ├── image_utils.py         # Shared PDF page rasterizing (PyMuPDF)
 ├── ai_extractor.py        # LLM field-extraction (structured JSON)
 ├── usage_tracker.py       # Token usage + estimated cost tracking

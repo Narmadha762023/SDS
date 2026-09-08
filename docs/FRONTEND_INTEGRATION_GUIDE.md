@@ -98,7 +98,7 @@ than fabricated.
 | `manufacturer_supplier` | string | AI-extracted |
 | `emergency_contact_phone` | string | AI-extracted |
 | `cas_number` | string | AI-extracted |
-| `ghs_hazard_pictograms` | array of `"GHSxx - Label"` strings | AI-extracted (text match + H-code lookup) + vision icon detection, merged |
+| `ghs_hazard_pictograms` | array of `"GHSxx - Label"` strings | AI-extracted (text match + H-code lookup) + icon detection (template match against embedded/rendered images, falling back to AI vision only if needed), merged -- see `BACKEND_AI_GUIDE.md` step 3 |
 | `safety_hazards` | string | AI-extracted |
 | `first_aid_measures` | string | AI-extracted |
 | `personal_protection` | string | AI-extracted |

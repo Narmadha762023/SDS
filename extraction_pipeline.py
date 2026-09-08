@@ -42,6 +42,8 @@ import ai_extractor
 import ocr
 import pictogram_detector
 import pdf_extractor
+import template_matcher
+from image_utils import pdf_to_page_images
 from usage_tracker import UsageTracker
 
 load_dotenv()
@@ -180,16 +182,49 @@ def parse_date_safe(raw: str):
         return None
 
 
-def _detect_pictogram_icons(file_bytes: bytes, filename: str, tracker=None) -> list:
-    """Best-effort vision-based pictogram icon detection.
+PICTOGRAM_DETECTION_MAX_PAGES = 3
 
-    A failure here (network, API) should not take down the rest of an
-    otherwise-successful extraction, so it degrades to "none detected"
-    rather than raising.
+
+def _detect_pictogram_icons(file_bytes: bytes, filename: str, tracker=None) -> list:
+    """Three-tier pictogram icon detection, cheapest/most-certain first:
+
+    1. Template match against embedded PDF images (template_matcher) --
+       deterministic, zero AI cost. Works when the SDS software embedded
+       each pictogram as its own image object (common, but not universal).
+    2. Template match against OpenCV-found red-diamond regions on the
+       rendered page (template_matcher) -- still zero AI cost, covers
+       pictograms drawn directly into the page instead of embedded.
+    3. AI vision fallback (pictogram_detector) -- only reached if both
+       non-AI tiers found nothing, e.g. a scanned page or a rendering
+       style neither tier recognizes.
+
+    A failure anywhere degrades to trying the next tier (or "none
+    detected" for the AI tier) rather than raising -- one broken step
+    should never take down an otherwise-successful extraction.
     """
     try:
+        found = template_matcher.match_embedded_images(
+            file_bytes, filename, max_pages=PICTOGRAM_DETECTION_MAX_PAGES
+        )
+        if found:
+            return found
+    except Exception:
+        pass
+
+    try:
+        page_images = pdf_to_page_images(file_bytes)[:PICTOGRAM_DETECTION_MAX_PAGES]
+        found = set()
+        for page_image in page_images:
+            found.update(template_matcher.match_page_regions(page_image))
+        if found:
+            return sorted(found)
+    except Exception:
+        pass
+
+    try:
         return pictogram_detector.detect_pictograms(
-            file_bytes, filename, OPENAI_API_KEY, OCR_MODEL, tracker=tracker
+            file_bytes, filename, OPENAI_API_KEY, OCR_MODEL,
+            max_pages=PICTOGRAM_DETECTION_MAX_PAGES, tracker=tracker,
         )
     except Exception:
         return []
