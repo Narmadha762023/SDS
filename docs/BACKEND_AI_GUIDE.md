@@ -10,6 +10,16 @@ This app has no separate backend service today -- `streamlit run app.py`
 data shapes and a proposed API layer if you need to expose this to a
 separate frontend.
 
+**Note on field set**: the record shape (this file's step 2 and the field
+map below) reflects `SDS-Extraction-Contract.pdf` (v2), supplied by the
+product owner as the target response shape -- new fields, the regex-first
+extraction tiers, and the validation notes throughout this doc trace back
+to that document. Fields it lists that aren't implemented yet (structured
+`hazard_statements`/`precautionary_statements` pairs, `disposal`,
+`regulatory_flags`, `language`, the `status`/`confidence`/`warnings`
+envelope) are a deliberate later phase -- see this file's "Known
+limitations" section. `keywords` **is** implemented -- see step 5.
+
 ## 1. File map
 
 | File | Responsibility |
@@ -19,12 +29,18 @@ separate frontend.
 | `repository.py` | Reads `response/sds_records.json` and renders the search list + summary popup + PDF download. Read-only; no extraction logic. |
 | `extraction_pipeline.py` | The core pipeline: extraction orchestration, field derivation, saving. No Streamlit dependency -- plain Python, safe to call from a worker thread. `bulk_upload.py` is its only caller today. |
 | `pdf_extractor.py` | `extract_text(pdf_bytes) -> str`. Reads a PDF's real text layer via `pdfplumber`. No AI involved. |
+| `regex_extractor.py` | Non-AI field extraction: fixed-format fields (dates, version, CAS-based ingredients, NFPA rating, transport codes, etc.) found by pattern matching, zero AI tokens. Tried before the AI call for every document; a field it doesn't find for a given document is asked of the AI instead (see step 2a). |
 | `ocr.py` | Vision-based text reading for scanned/image documents. Falls back to a combined text+pictogram vision call only if non-AI pictogram detection found nothing. |
 | `template_matcher.py` | Non-AI GHS pictogram detection (tiers 1-2, see step 3): embedded-image extraction + perceptual-hash template match, and OpenCV red-diamond region match. No AI involved, no tokens spent. |
 | `pictogram_templates/` | The 9 official GHS pictogram reference images (public domain UN artwork, sourced from Wikimedia Commons) that `template_matcher.py` matches against. |
 | `pictogram_detector.py` | AI vision fallback (tier 3) that recognizes GHS icon shapes, used only when `template_matcher.py`'s non-AI tiers find nothing. |
 | `image_utils.py` | `pdf_to_page_images()` / `image_to_data_url()` -- shared by `ocr.py`, `pictogram_detector.py`, and `template_matcher.py`. |
 | `ai_extractor.py` | `extract_fields(text, api_key, model) -> dict`. The single LLM call that pulls structured fields out of raw document text. |
+| `pdf_word_index.py` | Non-AI, position-aware search index: per-page word text + bounding boxes read straight from the PDF text layer (`pdfplumber`). PDF Extraction documents only. |
+| `pdf_render.py` | Renders one PDF page as a clean image (PyMuPDF), optionally with a real highlight annotation over a matched phrase's bounding box. |
+| `storage_paths.py` | Shared file-storage locations (`UPLOADS_DIR`, `RECORDS_FILE`, `RAW_TEXT_DIR`, `WORD_INDEX_DIR`) and `load_existing_records()` -- the single source of truth for both `extraction_pipeline.py` and `repository.py`, kept dependency-free so the read-only Repository page doesn't need the AI/extraction stack just to know where files live. |
+| `usage_tracker.py` | `UsageTracker` -- accumulates per-call token usage across however many AI calls make up one document, with `input_cost_usd()`/`output_cost_usd()` split by `MODEL_PRICING`. |
+| `token_usage_log.py` | Appends one row per processed document to `response/token_usage_log.xlsx` -- a standalone billing/tracking reference for the app owner, separate from the app's own UI (see step 6). |
 | `response/sds_records.json` | The "database" -- a flat JSON array of saved records, read-modify-write on every save. |
 | `uploads/` | The original PDF/image files, one per saved record, named `<record_id><ext>`. |
 
@@ -58,23 +74,66 @@ If the resulting text is empty/whitespace-only, extraction stops there --
 `extract_and_derive()` returns `(None, None)` and the caller (`bulk_upload.py`)
 logs that file as failed rather than saving anything.
 
-### Step 2 -- AI pulls out the structured fields
+### Step 2a -- Regex tries first, zero AI tokens
 
-`ai_extractor.extract_fields(raw_text, api_key, model)`:
+`extraction_pipeline._apply_regex_extraction(raw_text)` runs before the AI
+call, for every document. It uses `regex_extractor.py` to look for
+fixed-format fields that don't need language understanding to locate --
+just a known label and shape:
 
+- `version`, `revision_date`, `issue_date` -- exact-label patterns
+  (`Revision Number N`, `Revision Date ...`), validated 9/9 against real
+  documents.
+- `physical_state` -- a small fixed vocabulary (Solid/Liquid/Gas/Gel/...),
+  validated 8/9 (one miss during testing -- "Gel" wasn't in the initial
+  list -- fixed and now falls through to AI for any wording still outside
+  the list, rather than expanding the list indefinitely on guesses).
+- `product_code`, `synonyms`, `regulation_basis`, `signal_word`,
+  `flash_point`, `nfpa`, `transport`, `rcra_waste_code`, `ingredients` --
+  from `SDS-Extraction-Contract.pdf` v2. Hit rates vary per field (some
+  fields are legitimately absent from many documents, e.g. `rcra_waste_code`
+  only applies to EPA-listed hazardous chemicals) -- see the module
+  docstring in `regex_extractor.py` for the tested rate on each. A lower
+  hit rate doesn't mean less safe: a miss just falls through to the AI for
+  that field on that document, same as if this tier didn't run.
+- `split_sections()` splits text by the regulatory-mandated 16-section GHS
+  structure (1. Identification ... 16. Other information) -- this
+  numbering/order is legally required for a compliant SDS, so it's a safe
+  structural assumption across vendors, unlike the label wording within
+  each section.
+
+Every function here returns `None` (or an empty list) rather than a
+guess when it isn't confident -- the field-gap checklist below (step 2b)
+is what actually fills the rest.
+
+### Step 2b -- AI fills in whatever regex didn't find
+
+`ai_extractor.extract_fields(raw_text, api_key, model, skip_fields=...)`:
+
+- `skip_fields` is the set of keys step 2a already found for this
+  document -- those are dropped from the prompt entirely, not just
+  ignored in the response. A document where regex finds most fields gets
+  a smaller prompt *and* a smaller response, not just a discarded answer.
+  Measured on a real document: total tokens dropped from 8,805 (pictogram
+  tiers already optimized) to 4,508 once these fields were removed from
+  what's asked.
 - Sends the raw text (truncated to the first 60,000 characters) to the
   chat completions API with `temperature=0` and
   `response_format={"type": "json_object"}`.
-- The prompt (`USER_PROMPT_TEMPLATE` in `ai_extractor.py`) lists every
-  field with per-field instructions -- e.g. `version` explains what
-  labels count as a match ("Version", "Rev.", etc.); `safety_hazards` is
-  explicitly told to include *every* hazard statement found, not a
-  trimmed subset, since dropping one would be a real safety gap.
+- The prompt (`FIELD_PROMPTS` in `ai_extractor.py`, one snippet per field,
+  joined dynamically based on what's still needed) gives per-field
+  instructions -- e.g. `version` explains what labels count as a match
+  ("Version", "Rev.", etc.); `safety_hazards` is explicitly told to
+  include *every* hazard statement found, not a trimmed subset, since
+  dropping one would be a real safety gap.
 - The system prompt enforces the core rule: never guess, return `""` /
-  `[]` for anything not literally in the text.
+  `[]`/`{}` for anything not literally in the text.
 - The raw model response is parsed as JSON and validated key-by-key
   against `FIELDS_SCHEMA` -- any missing/malformed key falls back to the
   schema's empty default rather than propagating a bad shape.
+- The pipeline then overlays step 2a's regex-found values on top of the
+  AI's response (`fields.update(regex_fields)`), so a regex-found value
+  always wins for its own key -- the AI was never even asked about it.
 
 See `ai_extractor.FIELDS_SCHEMA` for the exact 16 keys this returns.
 
@@ -170,6 +229,18 @@ set from **three independent sources**, unioned together:
   `review_frequency_stated`. If found, `next_review_due` is *computed*
   (`revision_date + relativedelta(years=N)`) in Python -- never left to
   the model to do date arithmetic.
+- **`keywords`** (`generate_keywords()`, in `extract_and_derive()` after
+  `compute_derived_fields()`): 5-15 lowercased, de-duplicated search tags,
+  built entirely from fields already extracted -- product name & synonyms,
+  the pictogram labels already resolved in step 4, signal word, physical
+  state, and (when Section 1 states one) `regex_extractor.extract_recommended_use()`.
+  No AI call -- every term here is re-surfacing data this function already
+  has, so a model call would just spend tokens restating it. Deliberately
+  does NOT attempt chemical-family classification (the contract's other
+  keyword source, e.g. "aromatic hydrocarbon") -- that's a real chemistry
+  judgment, not something findable by pattern in the text, and guessing it
+  would be exactly the kind of invented value this app avoids everywhere
+  else.
 
 ### Step 6 -- Save
 
@@ -183,6 +254,14 @@ for the fields that would normally be user-chosen (`applies_to_site`,
 - `extraction_pipeline.append_record_to_store()` reads
   `response/sds_records.json`, appends the new record, writes the whole file
   back.
+- `token_usage_log.append_entry()` appends one row to
+  `response/token_usage_log.xlsx` for this document -- input/output
+  tokens, the model's per-1M-token rate for each, the actual
+  input/output/total cost incurred, model(s) used, call count. A separate
+  file from `sds_records.json` and never surfaced in the app's own UI --
+  purely a billing/tracking reference for whoever owns the OpenAI account.
+  Wrapped in try/except so a failure here (e.g. the file open elsewhere)
+  never blocks the actual record save.
 
 ## 3. Concurrency -- how the whole batch actually runs
 
@@ -226,6 +305,19 @@ vs. one document. What makes it "bulk" is orchestration:
 
 ## 4. Known limitations (be aware before extending)
 
+- **`SDS-Extraction-Contract.pdf` v2 fields not yet implemented**: structured
+  `hazard_statements`/`precautionary_statements` (paired code+text, deduped),
+  `disposal`, `regulatory_flags` (Prop 65/SARA 313/CERCLA/REACH/TSCA),
+  `language`, and the `status`/`overall_confidence`/`needs_review`/
+  `warnings` response envelope. (`keywords` is implemented -- step 5.)
+  These weren't moved to regex because testing
+  showed real accuracy risk: section-boundary text splitting disagreed with
+  AI extraction on 3 of 9 real documents for free-text fields, and this
+  vendor's documents don't state H-codes as literal text at all (only full
+  sentences), so a regex can't recover them the way it can a date or CAS
+  number. `next_review_due`'s fallback-when-no-cadence-stated policy is also
+  still open -- see the field-gap discussion for the "invent a default vs.
+  flag as needs-review" trade-off.
 - **No token/cost cap.** Usage is tracked and shown per-document and per-batch
   (`usage_tracker.py`), but nothing stops a batch before it runs -- the
   only upstream guards against runaway cost are the 60,000-character text
@@ -250,7 +342,8 @@ vs. one document. What makes it "bulk" is orchestration:
 
 | Want to... | Change... |
 |---|---|
-| Add/remove an extracted field | `ai_extractor.FIELDS_SCHEMA` + prompt text, then thread it through `extraction_pipeline.py`'s `compute_derived_fields()`, `bulk_upload.py`'s `_build_bulk_record()`, and `repository.py`'s `SUMMARY_FIELDS` |
+| Add/remove an AI-extracted field | `ai_extractor.FIELDS_SCHEMA` + `FIELD_PROMPTS`, then thread it through `extraction_pipeline.py`'s `compute_derived_fields()`, `bulk_upload.py`'s `_build_bulk_record()`, and `repository.py`'s `SUMMARY_FIELDS` |
+| Add/change a regex-first field | `regex_extractor.py` (new extractor function) + `extraction_pipeline._apply_regex_extraction()` (wire it in) -- also add the same key to `ai_extractor.FIELDS_SCHEMA`/`FIELD_PROMPTS` so it still has an AI fallback for documents the regex misses. Test against real documents before trusting -- see the module docstring's rationale on why some fields (H-codes, free-text safety fields) were deliberately NOT moved here |
 | Change pictogram matching rules | `extraction_pipeline.PICTOGRAM_DEFS` (synonyms) or `extraction_pipeline.H_CODE_TO_PICTOGRAMS` (H-code mapping) |
 | Change which model is used | `.env` -- `OPENAI_MODEL` (field extraction) / `OPENAI_OCR_MODEL` (vision calls) |
 | Change bulk concurrency | `bulk_upload.MAX_WORKERS` |

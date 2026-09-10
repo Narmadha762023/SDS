@@ -15,7 +15,10 @@ walks through the extraction pipeline step by step for anyone extending
 the AI/backend logic. [docs/FRONTEND_INTEGRATION_GUIDE.md](docs/FRONTEND_INTEGRATION_GUIDE.md)
 documents the exact input/output data shapes and proposes an API contract
 for a separate frontend to integrate against (not implemented today --
-this app has no HTTP API of its own, see that doc for why).
+this app has no HTTP API of its own, see that doc for why). The field set
+and validation rules follow `SDS-Extraction-Contract.pdf` (v2), the target
+response shape supplied by the product owner -- see `BACKEND_AI_GUIDE.md`
+for which parts of it are implemented and which are a later phase.
 
 ## How it works
 
@@ -141,6 +144,15 @@ Behind the scenes:
   actually fixes the slowness of processing many documents in sequence.
   The concurrency cap keeps this from overwhelming the AI service or
   tripping its rate limits.
+- A session-level guard blocks starting a second batch while one is still
+  running in the same browser session -- e.g. an accidental double-click
+  on "Start Bulk Processing." Without it, two overlapping runs could both
+  check "has this file been saved yet?" before either had written its
+  result, both see no, and both save it -- producing two identical
+  records (confirmed: this happened on a real batch before the guard was
+  added). This covers same-session double-firing; two genuinely separate
+  browser sessions racing on the same file at the same instant isn't
+  covered, and would need a cross-process lock to close entirely.
 - Each document is saved the moment its own extraction finishes -- no
   review form, no summary step.
 - Saving itself (writing the file + appending to the JSON record store)
@@ -156,6 +168,13 @@ Behind the scenes:
   *estimate* based on a fixed, manually-maintained price table (OpenAI
   doesn't expose pricing via the API), not an invoice-accurate figure;
   check platform.openai.com/usage for the real number.
+- **`response/token_usage_log.xlsx`** -- a standalone Excel file, separate
+  from the app's own UI, for tracking/billing purposes. One row is
+  appended per processed document (`token_usage_log.py`, right after that
+  document is saved): input/output tokens, the model's per-1M-token rate
+  for each, the actual input/output/total cost incurred, model(s) used,
+  and AI call count. Never rewritten for past rows -- a durable log, not a
+  live report.
 - **Known gaps, being upfront about them**: there's no *cap* on total
   cost for a batch (it's shown after the fact, not checked before
   starting), no retry/backoff if a call gets rate-limited (that one file
@@ -169,11 +188,49 @@ Behind the scenes:
 
 ## SDS Repository
 
-Lists every saved record with a search box (matches product name,
-manufacturer, or CAS number). Clicking **View** on a record pops up a
-summary of the critical fields (emergency contact, pictograms, hazards,
-first aid, PPE, storage, category, version, dates) plus an **Open Full
-SDS** button that downloads the original document from `uploads/`.
+Lists every saved record with a search box. Search checks the extracted
+fields first (product name, manufacturer, CAS number); if a term isn't
+found there, it falls back to searching the document itself -- for
+finding a detail that's genuinely in the SDS but wasn't one of the ~25
+fields the app extracts into structured data. This is exact substring
+matching, not semantic/AI search -- it finds literal text, the same as
+Ctrl+F, just automated across every document, with **zero AI calls and
+zero tokens** either way.
+
+Two tiers, most precise first:
+
+1. **`pdf_word_index.py`** -- searches word positions read directly off
+   the PDF's own text layer (`pdfplumber.extract_words()`), not a
+   flattened text dump. A match carries a real bounding box, so
+   `pdf_render.py` can render just that page as a clean image with the
+   matched phrase highlighted exactly, like a real PDF annotation --
+   rather than embedding the browser's native PDF viewer (which brings
+   its own toolbar and gets cluttered fast with more than one result
+   open). Only built for **PDF Extraction** documents, since only a real
+   text layer has positions to read -- an OCR'd/scanned page has none
+   (the transcription was never tied to on-page coordinates).
+2. **Page-level fallback** (`response/raw_text/`) -- plain substring
+   search over the document's flat extracted text, page number only (no
+   highlight box). Only saved for **OCR** documents, since `word_index`
+   fully supersedes it for PDF Extraction (exact bounding box vs.
+   page-only) -- saving both would just be the same text twice.
+
+Records saved before this feature existed have neither and aren't
+searchable this way until reprocessed.
+
+**This Streamlit app is a reference implementation, not the final UI** --
+the underlying capability (position-aware search, real bounding boxes) is
+what matters for a real integration; a separate application would consume
+`response/word_index/<id>.json` directly to draw its own highlight overlay
+in whatever PDF viewer it uses, rather than re-rendering a static image the
+way this reference app does for simplicity.
+
+Clicking **View** on a record pops up a summary of the critical fields
+(signal word, emergency contact, pictograms, hazards, first aid, PPE,
+storage, CAS number, product code(s), synonyms, physical state, flash
+point, category, regulation basis, RCRA waste code, version, dates, NFPA
+rating, transport information, and an ingredients table) plus an **Open
+Full SDS** button that downloads the original document from `uploads/`.
 
 ## Project structure
 
@@ -182,27 +239,51 @@ sds_app/
 ├── app.py                 # Entry point: page config + 2-page navigation
 ├── bulk_upload.py          # Bulk Upload page (concurrent extraction, no review)
 ├── repository.py          # SDS Repository page (search, summary popup, PDF link)
-├── extraction_pipeline.py # Shared pipeline: text/OCR -> AI fields -> derived fields -> save
+├── extraction_pipeline.py # Shared pipeline: text/OCR -> regex -> AI fields (fallback) -> derived fields -> save
+├── storage_paths.py       # Shared file-storage locations + load_existing_records() --
+│                           # single source of truth, dependency-free so read-only
+│                           # pages don't pull in the whole AI/extraction stack
+├── regex_extractor.py     # Non-AI field extraction (dates, version, CAS/ingredients,
+│                           # NFPA, transport, etc.) -- tried before the AI call
 ├── pdf_extractor.py       # PDF text-layer extraction
 ├── ocr.py                 # OCR via LLM vision (transcribes text; falls back to
 │                           # combined text+pictogram call only if non-AI
 │                           # detection found nothing)
 ├── template_matcher.py    # Non-AI GHS pictogram detection: embedded-image
 │                           # template match + OpenCV region match (tiers 1-2)
-├── pictogram_templates/   # The 9 official GHS pictogram reference images
-│                           # (public domain UN artwork) used for template matching
+├── pictogram_templates/   # The 9 official GHS pictogram reference PNGs
+│                           # (public domain UN artwork, sourced from Wikimedia
+│                           # Commons) used for template matching
 ├── pictogram_detector.py  # AI vision fallback (tier 3) that recognizes GHS
 │                           # icon shapes when the non-AI tiers find nothing
 ├── image_utils.py         # Shared PDF page rasterizing (PyMuPDF)
 ├── ai_extractor.py        # LLM field-extraction (structured JSON)
 ├── usage_tracker.py       # Token usage + estimated cost tracking
+├── token_usage_log.py     # Appends one row per processed document to
+│                           # response/token_usage_log.xlsx -- owner's own
+│                           # billing/tracking reference, not shown in the app
+├── pdf_word_index.py      # Position-aware search index: word bounding boxes
+│                           # read straight from the PDF text layer (PDF
+│                           # Extraction documents only), zero AI
+├── pdf_render.py           # Renders one PDF page as a clean image, with a
+│                           # real highlight over a matched phrase if given
+│                           # a bounding box (PyMuPDF)
 ├── requirements.txt
 ├── .env                    # OPENAI_API_KEY (not committed with a real value)
 ├── docs/
 │   ├── BACKEND_AI_GUIDE.md            # Pipeline internals, step by step
 │   └── FRONTEND_INTEGRATION_GUIDE.md  # I/O data shapes + proposed API
 ├── response/
-│   └── sds_records.json   # The saved-record "database" (see below)
+│   ├── sds_records.json   # The saved-record "database" (see below)
+│   ├── token_usage_log.xlsx  # Owner's billing/tracking reference -- one
+│   │                       # row per processed document, never shown in the app
+│   ├── raw_text/           # One .txt per record -- page-level search
+│   │                       # fallback -- OCR documents only; PDF Extraction
+│   │                       # documents get word_index/ instead, never both
+│   └── word_index/         # One .json per record (PDF Extraction only) --
+│                           # per-page word text + bounding boxes, the
+│                           # data a real integration would use to draw
+│                           # its own highlight overlay
 ├── uploads/                # Copies of every saved document (see below)
 └── README.md
 ```

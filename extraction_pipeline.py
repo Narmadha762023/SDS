@@ -32,7 +32,6 @@ import json
 import os
 import re
 from datetime import date
-from pathlib import Path
 
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
@@ -42,19 +41,13 @@ import ai_extractor
 import ocr
 import pictogram_detector
 import pdf_extractor
+import regex_extractor
 import template_matcher
 from image_utils import pdf_to_page_images
+from storage_paths import RECORDS_FILE, RAW_TEXT_DIR, load_existing_records
 from usage_tracker import UsageTracker
 
 load_dotenv()
-
-APP_DIR = Path(__file__).parent
-UPLOADS_DIR = APP_DIR / "uploads"
-RESPONSE_DIR = APP_DIR / "response"
-RECORDS_FILE = RESPONSE_DIR / "sds_records.json"
-
-UPLOADS_DIR.mkdir(exist_ok=True)
-RESPONSE_DIR.mkdir(exist_ok=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -284,6 +277,106 @@ def compute_derived_fields(fields: dict, filename: str, detected_pictogram_codes
     }
 
 
+KEYWORD_STOPWORDS = {
+    "and", "or", "the", "of", "in", "for", "with", "a", "an", "is", "this",
+    "not", "no", "to", "on", "as", "by", "at", "from",
+    "category",  # structural word from category strings ("... Category 2"), not a descriptive tag
+    "none",      # a literal "NONE" signal_word means "not applicable", not a hazard descriptor
+}
+
+
+def generate_keywords(fields: dict, derived: dict, raw_text: str) -> list:
+    """SDS-Extraction-Contract.pdf v2's `keywords` field: 5-15 lowercased,
+    de-duplicated search tags -- product name & synonyms, hazard words,
+    physical state, and (when Section 1 states one) recommended use.
+    Deliberately NOT sent through the AI: every term here is re-surfacing
+    something already extracted elsewhere (product name, synonyms, the
+    pictogram labels already resolved in compute_derived_fields, a plain
+    regex match on Section 1), so a separate model call would just be
+    spending tokens to restate data this function already has for free.
+
+    Chemical-family classification (the contract's other keyword source,
+    e.g. "aromatic hydrocarbon") is deliberately NOT attempted here --
+    that's a real chemistry classification judgment, not something
+    findable by pattern in the document text, and guessing it would be
+    exactly the kind of invented value this app avoids everywhere else.
+    """
+    terms = []
+
+    name = fields.get("product_chemical_name") or ""
+    if name:
+        terms.append(name.lower())
+        terms.extend(re.split(r"[^a-z0-9]+", name.lower()))
+
+    for synonym in fields.get("synonyms") or []:
+        if synonym:
+            terms.append(synonym.lower())
+
+    for label in derived.get("ghs_hazard_pictograms") or []:
+        if " - " in label:
+            terms.append(label.split(" - ", 1)[1].lower())
+
+    if fields.get("signal_word"):
+        terms.append(fields["signal_word"].lower())
+
+    if fields.get("physical_state"):
+        terms.append(fields["physical_state"].lower())
+
+    category = fields.get("category") or ""
+    terms.extend(t for t in re.split(r"[^a-z0-9]+", category.lower()) if not t.isdigit())
+
+    recommended_use = regex_extractor.extract_recommended_use(raw_text)
+    if recommended_use:
+        terms.append(recommended_use.lower())
+
+    seen = set()
+    keywords = []
+    for term in terms:
+        term = term.strip()
+        if len(term) < 3 or term in KEYWORD_STOPWORDS or term in seen:
+            continue
+        seen.add(term)
+        keywords.append(term)
+        if len(keywords) >= 15:
+            break
+
+    return keywords
+
+
+def _apply_regex_extraction(raw_text: str) -> dict:
+    """Tier-1 field extraction: fixed-format values found by pattern
+    matching, zero AI tokens (see regex_extractor.py's module docstring
+    for the accuracy rationale and per-field hit rates this was validated
+    against). Returns only the keys it actually found a confident value
+    for -- a key that's missing here means "regex didn't find it for this
+    document", not "this document has no value"; the caller asks the AI
+    for whichever keys are missing, exactly as if this function didn't
+    run at all.
+    """
+    sections = regex_extractor.split_sections(raw_text)
+    found = {}
+
+    def _set(key, value):
+        if value:
+            found[key] = value
+
+    _set("version", regex_extractor.extract_version(raw_text))
+    _set("revision_date", regex_extractor.extract_revision_date_raw(raw_text))
+    _set("issue_date", regex_extractor.extract_issue_date_raw(raw_text))
+    _set("physical_state", regex_extractor.extract_physical_state(raw_text))
+    _set("product_code", regex_extractor.extract_product_code(raw_text))
+    _set("synonyms", regex_extractor.extract_synonyms(raw_text))
+    _set("regulation_basis", regex_extractor.extract_regulation_basis(raw_text))
+    _set("signal_word", regex_extractor.extract_signal_word(raw_text))
+    _set("flash_point", regex_extractor.extract_flash_point(sections))
+    _set("nfpa", regex_extractor.extract_nfpa(raw_text))
+    _set("transport", regex_extractor.extract_transport(sections))
+    _set("rcra_waste_code", regex_extractor.extract_rcra_waste_code(sections))
+    _set("ingredients", regex_extractor.extract_ingredients(sections))
+
+    return found
+
+
 def extract_and_derive(method: str, file_bytes: bytes, filename: str):
     """Run the full extraction pipeline for one document: text/OCR -> AI
     fields -> pictogram icon detection -> derived fields. No Streamlit
@@ -314,10 +407,32 @@ def extract_and_derive(method: str, file_bytes: bytes, filename: str):
         if not raw_text.strip():
             return None, None
 
-    fields = ai_extractor.extract_fields(raw_text, OPENAI_API_KEY, AI_MODEL, tracker=tracker)
+    regex_fields = _apply_regex_extraction(raw_text)
+    fields = ai_extractor.extract_fields(
+        raw_text, OPENAI_API_KEY, AI_MODEL, tracker=tracker,
+        skip_fields=set(regex_fields.keys()),
+    )
+    fields.update(regex_fields)
+
     derived = compute_derived_fields(fields, filename, detected_pictogram_codes)
     derived["token_usage"] = tracker.summary()
+    # Kept on `derived` (not written to disk here) so a caller running this
+    # inside a worker thread decides when/whether to persist it -- see
+    # save_raw_text(). This is the same text already sent to the AI; saving
+    # it means it doesn't have to be re-extracted to support full-text
+    # search later.
+    derived["raw_text"] = raw_text
+    derived["keywords"] = generate_keywords(fields, derived, raw_text)
     return fields, derived
+
+
+def save_raw_text(record_id: str, raw_text: str) -> None:
+    """Persist one document's extracted text for later full-text search
+    (see repository.py). Stored one file per record, separate from
+    RECORDS_FILE, so the (frequently read-modify-written) main record
+    store stays small regardless of how much raw text accumulates.
+    """
+    (RAW_TEXT_DIR / f"{record_id}.txt").write_text(raw_text, encoding="utf-8")
 
 
 def compute_file_hash(file_bytes: bytes) -> str:
@@ -327,16 +442,6 @@ def compute_file_hash(file_bytes: bytes) -> str:
     never get falsely flagged as duplicates.
     """
     return hashlib.sha256(file_bytes).hexdigest()
-
-
-def load_existing_records() -> list:
-    """All records currently in the store, or [] if none/unreadable."""
-    if not RECORDS_FILE.exists():
-        return []
-    try:
-        return json.loads(RECORDS_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
 
 
 def load_existing_hashes() -> dict:

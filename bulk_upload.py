@@ -61,6 +61,9 @@ from pathlib import Path
 import streamlit as st
 
 import extraction_pipeline as up
+import pdf_word_index
+import token_usage_log
+from storage_paths import UPLOADS_DIR
 
 MAX_WORKERS = 5
 
@@ -131,6 +134,17 @@ def _build_bulk_record(filename: str, file_hash: str, method: str, fields: dict,
         "storage": fields["storage"],
         "physical_state": fields["physical_state"],
         "category": fields["category"],
+        # -- SDS-Extraction-Contract.pdf v2 additions --
+        "product_code": fields["product_code"],
+        "synonyms": fields["synonyms"],
+        "regulation_basis": fields["regulation_basis"],
+        "signal_word": fields["signal_word"],
+        "flash_point": fields["flash_point"],
+        "nfpa": fields["nfpa"],
+        "transport": fields["transport"],
+        "rcra_waste_code": fields["rcra_waste_code"],
+        "ingredients": fields["ingredients"],
+        "keywords": derived["keywords"],
         "version": derived["version"],
         "revision_date": str(derived["revision_date_parsed"] or ""),
         "issue_date": str(derived["issue_date_parsed"] or ""),
@@ -277,6 +291,32 @@ def render() -> None:
     if not jobs:
         return
 
+    # Guards against the same batch being started twice concurrently in
+    # this session -- e.g. an accidental double-click on "Start Bulk
+    # Processing" before the button visually disables, or the script
+    # rerunning mid-batch. Without this, two overlapping runs can both
+    # check "has this file been saved yet?" before either has written its
+    # result, both see no, and both save it -- producing two identical
+    # records with the same file hash and the same timestamp (confirmed:
+    # this happened on a real batch before this guard existed). This
+    # covers same-session double-firing; it does not cover two genuinely
+    # separate browser sessions racing on the same file at the same
+    # instant, which would need a cross-process lock to close entirely.
+    if st.session_state.get("bulk_processing_active"):
+        st.warning(
+            "A batch is already being processed in this session. Wait for "
+            "it to finish before starting another."
+        )
+        return
+    st.session_state["bulk_processing_active"] = True
+
+    try:
+        _run_bulk_batch(jobs, method)
+    finally:
+        st.session_state["bulk_processing_active"] = False
+
+
+def _run_bulk_batch(jobs: list, method: str) -> None:
     new_jobs, duplicate_jobs = _split_new_and_duplicate(jobs)
 
     if duplicate_jobs:
@@ -328,8 +368,25 @@ def render() -> None:
                 log.write(f"❌ **{filename}** -- {error_detail or 'no text could be extracted'}")
             else:
                 record = _build_bulk_record(filename, file_hash, method, fields, derived)
-                (up.UPLOADS_DIR / record["stored_document"]).write_bytes(file_bytes)
+                (UPLOADS_DIR / record["stored_document"]).write_bytes(file_bytes)
                 up.append_record_to_store(record)
+                if method == "PDF Extraction":
+                    # Only a real PDF text layer has word positions to
+                    # index -- an OCR'd/scanned document has none (the
+                    # transcription was never tied to on-page coordinates).
+                    # word_index supersedes raw_text for this method (exact
+                    # bounding boxes vs. page-only), so raw_text is skipped
+                    # here to avoid saving the same text twice.
+                    try:
+                        pdf_word_index.save_word_index(record["id"], file_bytes)
+                    except Exception:
+                        pass
+                else:
+                    up.save_raw_text(record["id"], derived["raw_text"])
+                try:
+                    token_usage_log.append_entry(record, derived)
+                except Exception:
+                    pass  # billing-reference log only -- never block a save over it
                 saved += 1
                 usage = derived["token_usage"]
                 total_tokens += usage["total_tokens"]

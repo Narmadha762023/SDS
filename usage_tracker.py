@@ -60,31 +60,56 @@ class UsageTracker:
     def call_count(self) -> int:
         return len(self.calls)
 
-    def estimated_cost_usd(self) -> float:
-        """Sum of (tokens / 1e6) * rate per call, using MODEL_PRICING.
-        Calls for a model not in the table are silently excluded from the
-        total (never guess a rate) -- `has_unpriced_calls` tells the
-        caller whether that happened, so the UI can flag it.
+    def input_cost_usd(self) -> float:
+        """Sum of (prompt_tokens / 1e6) * input rate, using MODEL_PRICING.
+        Calls for a model not in the table are silently excluded (never
+        guess a rate) -- `has_unpriced_calls` tells the caller whether
+        that happened.
         """
         cost = 0.0
         for c in self.calls:
             rates = MODEL_PRICING.get(c["model"])
-            if not rates:
-                continue
-            cost += (c["prompt_tokens"] / 1_000_000) * rates["input"]
-            cost += (c["completion_tokens"] / 1_000_000) * rates["output"]
+            if rates:
+                cost += (c["prompt_tokens"] / 1_000_000) * rates["input"]
         return cost
+
+    def output_cost_usd(self) -> float:
+        """Sum of (completion_tokens / 1e6) * output rate. See input_cost_usd()."""
+        cost = 0.0
+        for c in self.calls:
+            rates = MODEL_PRICING.get(c["model"])
+            if rates:
+                cost += (c["completion_tokens"] / 1_000_000) * rates["output"]
+        return cost
+
+    def estimated_cost_usd(self) -> float:
+        """Total estimated cost -- input_cost_usd() + output_cost_usd()."""
+        return self.input_cost_usd() + self.output_cost_usd()
 
     @property
     def has_unpriced_calls(self) -> bool:
         return any(c["model"] not in MODEL_PRICING for c in self.calls)
+
+    @property
+    def models_used(self) -> list:
+        """Unique model names seen across calls, in first-seen order --
+        usually just one, but a document can mix models if OPENAI_MODEL
+        and OPENAI_OCR_MODEL differ."""
+        seen = []
+        for c in self.calls:
+            if c["model"] not in seen:
+                seen.append(c["model"])
+        return seen
 
     def summary(self) -> dict:
         return {
             "total_tokens": self.total_tokens,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "input_cost_usd": self.input_cost_usd(),
+            "output_cost_usd": self.output_cost_usd(),
             "estimated_cost_usd": self.estimated_cost_usd(),
             "call_count": self.call_count,
             "has_unpriced_calls": self.has_unpriced_calls,
+            "models_used": self.models_used,
         }

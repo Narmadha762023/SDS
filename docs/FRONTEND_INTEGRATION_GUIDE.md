@@ -60,6 +60,17 @@ legitimately be `""` / `[]` -- the AI is instructed to never guess, so a
 field simply not present in the source document comes back empty rather
 than fabricated.
 
+Fields marked "regex, AI fallback" are found by pattern matching first
+(zero AI tokens, see `regex_extractor.py`) and only sent to the AI for a
+given document if the pattern isn't found there -- from the caller's side
+this is invisible, the field is populated either way, just sometimes for
+free. This field set follows `SDS-Extraction-Contract.pdf` v2; a few of
+that contract's fields (structured hazard/precautionary statement pairs,
+`disposal`, `regulatory_flags`, `language`, and the
+`status`/`confidence`/`warnings` envelope) aren't implemented yet -- see
+`BACKEND_AI_GUIDE.md` section 4 for why. `keywords` **is** implemented,
+deterministically (no AI) -- see `extraction_pipeline.generate_keywords()`.
+
 ```json
 {
   "id": "e0629327-f12a-4557-8ce9-808a455d613c",
@@ -74,6 +85,16 @@ than fabricated.
   "storage": "Keep in cool dry place.",
   "physical_state": "Liquid",
   "category": "Flammable Liquid",
+  "product_code": ["AC326980000", "AC326981000"],
+  "synonyms": ["Tol", "Methylbenzene"],
+  "regulation_basis": "US OSHA Hazard Communication Standard 2024 (29 CFR 1910.1200)",
+  "signal_word": "DANGER",
+  "flash_point": "4 C",
+  "nfpa": {"health": 3, "flammability": 3, "instability": 0},
+  "transport": {"un_no": "UN1294", "shipping_name": "TOLUENE", "hazard_class": "3", "packing_group": "II"},
+  "rcra_waste_code": "U220",
+  "ingredients": [{"name": "Toluene", "cas_number": "108-88-3", "concentration": "<=100%"}],
+  "keywords": ["toluene", "flammable", "irritant", "liquid", "laboratory chemicals"],
   "version": "3.2",
   "revision_date": "2025-03-03",
   "issue_date": "",
@@ -103,11 +124,21 @@ than fabricated.
 | `first_aid_measures` | string | AI-extracted |
 | `personal_protection` | string | AI-extracted |
 | `storage` | string | AI-extracted |
-| `physical_state` | string | AI-extracted |
+| `physical_state` | string | regex (fixed vocabulary: Solid/Liquid/Gas/Gel/...), AI fallback |
 | `category` | string | AI-extracted |
-| `version` | string | AI-extracted, or parsed from filename as fallback |
-| `revision_date` | string, `YYYY-MM-DD` or `""` | AI-extracted, parsed |
-| `issue_date` | string, `YYYY-MM-DD` or `""` | AI-extracted, parsed |
+| `product_code` | array of strings | regex (Section 1 catalog numbers), AI fallback |
+| `synonyms` | array of strings | regex (Section 1 "Synonyms" label), AI fallback |
+| `regulation_basis` | string | regex, AI fallback |
+| `signal_word` | `"DANGER"` \| `"WARNING"` \| `"NONE"` \| `""` | regex, AI fallback |
+| `flash_point` | string | regex (Section 9), AI fallback |
+| `nfpa` | object `{health, flammability, instability}` or `{}` | regex (Section 5/16 NFPA 704 diamond), AI fallback |
+| `transport` | object `{un_no, shipping_name, hazard_class, packing_group}` or `{}` | regex (Section 14), AI fallback |
+| `rcra_waste_code` | string | regex (Section 13), AI fallback |
+| `ingredients` | array of `{name, cas_number, concentration}` | regex (Section 3 composition table, one row per line), AI fallback |
+| `keywords` | array of strings, 5-15 lowercased tags | deterministic, no AI -- derived from product name/synonyms/pictogram labels/signal word/physical state/recommended use (`extraction_pipeline.generate_keywords()`); powers tag-based filtering, not free-text search |
+| `version` | string | regex (`Revision Number N`), AI fallback, or parsed from filename as last resort |
+| `revision_date` | string, `YYYY-MM-DD` or `""` | regex (`Revision Date ...`), AI fallback, parsed |
+| `issue_date` | string, `YYYY-MM-DD` or `""` | regex (`Creation Date`/`Issue Date`), AI fallback, parsed |
 | `applies_to_site` | string | defaulted to `"All Sites"` -- no review step sets this today |
 | `review_owners` | array of strings | defaulted to `[]` -- no review step sets this today |
 | `review_frequency` | string | AI-extracted if stated in doc, else default `"Annually"` |
@@ -129,14 +160,18 @@ context (including a real API server):
 
 ```python
 fields, derived = extraction_pipeline.extract_and_derive(method, file_bytes, filename)
-# fields:  dict matching ai_extractor.FIELDS_SCHEMA (16 keys, see below)
+# fields:  dict matching ai_extractor.FIELDS_SCHEMA (25 keys, see below) --
+#          each key is populated by regex_extractor.py first where a tier
+#          exists for it, falling back to the AI for whatever it missed
+#          (extraction_pipeline._apply_regex_extraction() + skip_fields)
 # derived: dict with ghs_selected_codes, ghs_hazard_pictograms,
 #          version, version_source, revision_date_parsed, issue_date_parsed,
 #          review_frequency, review_frequency_raw, next_review_due
 # Returns (None, None) if no text could be extracted from the document.
 ```
 
-`ai_extractor.FIELDS_SCHEMA` (the raw AI output, before derivation):
+`ai_extractor.FIELDS_SCHEMA` (the full field set, before derivation --
+this is also the schema `regex_extractor.py` fills in wherever it can):
 
 ```python
 {
@@ -156,8 +191,54 @@ fields, derived = extraction_pipeline.extract_and_derive(method, file_bytes, fil
     "personal_protection": "",
     "storage": "",
     "review_frequency_stated": "",
+    # -- SDS-Extraction-Contract.pdf v2 additions (regex-first, AI fallback) --
+    "product_code": [],
+    "synonyms": [],
+    "regulation_basis": "",
+    "signal_word": "",
+    "flash_point": "",
+    "nfpa": {},                         # {"health": 3, "flammability": 3, "instability": 0}
+    "transport": {},                    # {"un_no": "UN1294", "shipping_name": ..., "hazard_class": ..., "packing_group": ...}
+    "rcra_waste_code": "",
+    "ingredients": [],                  # [{"name": ..., "cas_number": ..., "concentration": ...}]
 }
 ```
+
+### Position-aware search data (for a real "highlight this match" UI)
+
+The **SDS Repository** page's search (see `repository.py`) can find a term
+that's genuinely in a document but wasn't one of the extracted fields
+above, and open the source page with the exact phrase highlighted. In this
+reference app, that's rendered as a static image (`pdf_render.py`) for
+simplicity -- **a real integration wouldn't do that**. It would instead
+consume the underlying data directly and draw its own highlight overlay in
+whatever PDF viewer/component it already uses (e.g. PDF.js).
+
+That data lives in `response/word_index/<record_id>.json`
+(`pdf_word_index.py`, PDF Extraction documents only -- see the module
+docstring for why OCR documents have no equivalent), shaped as:
+
+```python
+[
+  {
+    "page": 5,
+    "text": "4-Methylbenzyl alcohol Revision Date 19-Dec-2025 ...",  # all words on the page, space-joined
+    "words": [
+      {"text": "4-Methylbenzyl", "x0": 53.9, "top": 37.7, "x1": 125.3, "bottom": 47.7},
+      {"text": "alcohol", "x0": 128.1, "top": 37.7, "x1": 163.1, "bottom": 47.7},
+      ...
+    ]
+  },
+  ...  # one entry per page
+]
+```
+
+`x0`/`x1`/`top`/`bottom` are in the PDF's own page-point coordinate space
+(the same system `pdfplumber` and `PyMuPDF`/most PDF renderers use for an
+unrotated page -- no conversion needed). `pdf_word_index.find_match(record_id,
+needle)` shows the matching logic: substring-search the page's joined
+`text`, map the matched character range back to the word(s) it spans, and
+take the union of their bounding boxes as the highlight rectangle.
 
 ---
 

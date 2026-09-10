@@ -24,6 +24,7 @@ being trusted: pixel-identical to the vendor-embedded GHS02 and GHS05
 icons found in that document.
 """
 
+import io
 from pathlib import Path
 
 import cv2
@@ -99,7 +100,7 @@ def match_icon(image_bytes: bytes) -> str | None:
     never a guess.
     """
     try:
-        pil_image = Image.open(__import__("io").BytesIO(image_bytes)).convert("RGB")
+        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         return None
 
