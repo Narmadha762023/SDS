@@ -27,6 +27,8 @@ extraction service.
 
 import re
 
+import hazard_statement_lookup
+
 HEADER_RE = re.compile(r"(?m)^(\d{1,2})\.\s+([A-Za-z][^\n]{2,60})$")
 
 VERSION_RE = re.compile(r"Revision Number\s+(\S+)")
@@ -68,6 +70,29 @@ PACKING_GROUP_RE = re.compile(r"Packing Group[:\s]*\n?\s*(I{1,3}|N/?A)", re.IGNO
 SHIPPING_NAME_RE = re.compile(r"Proper Shipping Name[:\s]*\n?\s*([^\n]+)", re.IGNORECASE)
 
 RCRA_CODE_RE = re.compile(r"\b([UPFDK]\d{3,4})\b")
+
+# Hazard statements are anchored on the H-CODE, not the sentence: a code
+# literally printed in the document is the only thing that can put an
+# entry in this field. A document that states hazard sentences but no
+# codes (real vendor families do this -- Fisher Scientific/Acros Organics
+# print only "Highly flammable liquid and vapor") yields [] rather than a
+# code worked backwards from the wording, which would be asserting
+# something the document never said.
+#
+# Scoped to Section 2's own hazard-statement block on purpose: a
+# whole-document scan over-collects badly -- real documents repeat codes
+# in per-ingredient classifications (Section 3) and full-text reference
+# lists (Section 16), e.g. SILVER NITRATE LRG's Section 2 lists 4 codes
+# while the file contains 6 distinct ones.
+HAZARD_BLOCK_RE = re.compile(
+    r"Hazard statements\s+(.*?)(?=Precautionary statements|\n\d+\.\s|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+# The negative lookbehind matters: without it "EUH066" matches as "H066"
+# (confirmed on a real document).
+HAZARD_LINE_RE = re.compile(
+    r"(?<![A-Z])(H\d{3})\s*([^\n]*?)(?=\s*(?<![A-Z])H\d{3}\s|\n|\Z)"
+)
 
 # Section 1's stated use, e.g. "Recommended Use Laboratory chemicals." --
 # feeds keyword generation (extraction_pipeline.generate_keywords), not a
@@ -221,3 +246,30 @@ def extract_ingredients(sections: dict):
 def extract_recommended_use(text: str):
     m = RECOMMENDED_USE_RE.search(text)
     return m.group(1).strip() if m else None
+
+
+def extract_hazard_statements(text: str):
+    """Returns [{"code": "H272", "text": "May intensify fire; oxidiser."}, ...]
+    for every H-code literally printed in the document's Section 2 hazard
+    statements, or None if the document prints no codes there.
+
+    The code always comes from the document. The statement text prefers the
+    document's own wording next to that code, and falls back to the code's
+    official text (hazard_statement_lookup) only when the document prints
+    the code with no sentence beside it -- that fallback expands a code the
+    document itself asserted, it never works a code backwards from a
+    sentence.
+    """
+    block_match = HAZARD_BLOCK_RE.search(text)
+    if not block_match:
+        return None
+
+    statements = []
+    for code, statement in HAZARD_LINE_RE.findall(block_match.group(1)):
+        statement = statement.strip()
+        if not statement:
+            statement = hazard_statement_lookup.text_for_code(code) or ""
+        if statement and not statement.endswith("."):
+            statement += "."
+        statements.append({"code": code, "text": statement})
+    return statements or None

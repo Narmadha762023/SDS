@@ -60,11 +60,16 @@ FIELDS_SCHEMA = {
     "transport": {},
     "rcra_waste_code": "",
     "ingredients": [],
+    # Never AI-extracted (no FIELD_PROMPTS entry): hazard statements are
+    # anchored on H-codes literally printed in the document, found by
+    # regex_extractor. Listed here only so the output shape always has the
+    # key, defaulting to [] when a document prints no codes.
+    "hazard_statements": [],
 }
 
 LIST_FIELDS = (
     "ghs_hazard_pictograms", "hazard_statement_codes", "product_code",
-    "synonyms", "ingredients",
+    "synonyms", "ingredients", "hazard_statements",
 )
 DICT_FIELDS = ("nfpa", "transport")
 
@@ -240,7 +245,12 @@ def extract_fields(
         return result
 
     skip_fields = skip_fields or set()
-    fields_to_ask = [k for k in FIELDS_SCHEMA if k not in skip_fields]
+    # FIELD_PROMPTS membership is what makes a field AI-extractable at all;
+    # a schema key without a prompt (hazard_statements) is filled elsewhere
+    # and must never be asked for.
+    fields_to_ask = [
+        k for k in FIELDS_SCHEMA if k not in skip_fields and k in FIELD_PROMPTS
+    ]
     if not fields_to_ask:
         return result
 

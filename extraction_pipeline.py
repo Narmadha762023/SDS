@@ -229,9 +229,17 @@ def compute_derived_fields(fields: dict, filename: str, detected_pictogram_codes
     filename version fallback, date parsing, and the review-cadence
     computation.
     """
-    ghs_selected = match_pictograms(
-        fields["ghs_hazard_pictograms"], fields.get("hazard_statement_codes")
+    # hazard_statement_codes (AI) and hazard_statements[].code (regex-first,
+    # zero AI cost when the document states codes literally -- see
+    # regex_extractor.extract_hazard_statements) are two independent
+    # sources of the same kind of signal; combining them costs nothing
+    # extra and can only add pictogram matches, never remove ones the AI
+    # already found.
+    all_hazard_codes = list(fields.get("hazard_statement_codes") or [])
+    all_hazard_codes.extend(
+        h["code"] for h in (fields.get("hazard_statements") or []) if h.get("code")
     )
+    ghs_selected = match_pictograms(fields["ghs_hazard_pictograms"], all_hazard_codes)
     ghs_selected.update(detected_pictogram_codes)
     ghs_labels = [
         f"{pic['code']} - {pic['label']}"
@@ -373,6 +381,7 @@ def _apply_regex_extraction(raw_text: str) -> dict:
     _set("transport", regex_extractor.extract_transport(sections))
     _set("rcra_waste_code", regex_extractor.extract_rcra_waste_code(sections))
     _set("ingredients", regex_extractor.extract_ingredients(sections))
+    _set("hazard_statements", regex_extractor.extract_hazard_statements(raw_text))
 
     return found
 

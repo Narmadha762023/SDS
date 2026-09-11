@@ -245,6 +245,10 @@ sds_app/
 │                           # pages don't pull in the whole AI/extraction stack
 ├── regex_extractor.py     # Non-AI field extraction (dates, version, CAS/ingredients,
 │                           # NFPA, transport, etc.) -- tried before the AI call
+├── hazard_statement_lookup.py  # Official H-code -> hazard-statement-text
+│                           # table; supplies wording for a code the document
+│                           # printed. No text -> code direction, so a code is
+│                           # never derived from a sentence
 ├── pdf_extractor.py       # PDF text-layer extraction
 ├── ocr.py                 # OCR via LLM vision (transcribes text; falls back to
 │                           # combined text+pictogram call only if non-AI

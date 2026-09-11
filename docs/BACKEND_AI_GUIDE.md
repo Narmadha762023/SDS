@@ -14,11 +14,12 @@ separate frontend.
 map below) reflects `SDS-Extraction-Contract.pdf` (v2), supplied by the
 product owner as the target response shape -- new fields, the regex-first
 extraction tiers, and the validation notes throughout this doc trace back
-to that document. Fields it lists that aren't implemented yet (structured
-`hazard_statements`/`precautionary_statements` pairs, `disposal`,
-`regulatory_flags`, `language`, the `status`/`confidence`/`warnings`
-envelope) are a deliberate later phase -- see this file's "Known
-limitations" section. `keywords` **is** implemented -- see step 5.
+to that document. Fields it lists that aren't implemented yet
+(`precautionary_statements` pairs, `disposal`, `regulatory_flags`,
+`language`, the `status`/`confidence`/`warnings` envelope) are a
+deliberate later phase -- see this file's "Known limitations" section.
+`keywords` **is** implemented -- see step 5. `hazard_statements` **is**
+implemented -- see step 4a.
 
 ## 1. File map
 
@@ -30,6 +31,7 @@ limitations" section. `keywords` **is** implemented -- see step 5.
 | `extraction_pipeline.py` | The core pipeline: extraction orchestration, field derivation, saving. No Streamlit dependency -- plain Python, safe to call from a worker thread. `bulk_upload.py` is its only caller today. |
 | `pdf_extractor.py` | `extract_text(pdf_bytes) -> str`. Reads a PDF's real text layer via `pdfplumber`. No AI involved. |
 | `regex_extractor.py` | Non-AI field extraction: fixed-format fields (dates, version, CAS-based ingredients, NFPA rating, transport codes, etc.) found by pattern matching, zero AI tokens. Tried before the AI call for every document; a field it doesn't find for a given document is asked of the AI instead (see step 2a). |
+| `hazard_statement_lookup.py` | Official H-code -> hazard-statement-text table (UN GHS/EU CLP). Forward direction only: supplies official wording for a code the document printed. Deliberately offers no text -> code direction -- see step 4a. |
 | `ocr.py` | Vision-based text reading for scanned/image documents. Falls back to a combined text+pictogram vision call only if non-AI pictogram detection found nothing. |
 | `template_matcher.py` | Non-AI GHS pictogram detection (tiers 1-2, see step 3): embedded-image extraction + perceptual-hash template match, and OpenCV red-diamond region match. No AI involved, no tokens spent. |
 | `pictogram_templates/` | The 9 official GHS pictogram reference images (public domain UN artwork, sourced from Wikimedia Commons) that `template_matcher.py` matches against. |
@@ -203,16 +205,57 @@ set from **three independent sources**, unioned together:
 1. **Direct text match** -- `match_pictograms()` checks each AI-returned
    `ghs_hazard_pictograms` string against `PICTOGRAM_DEFS` (code, label, or
    a synonym list like "flame", "skull", "exclamation").
-2. **H-code lookup (deterministic)** -- the AI separately extracted any
-   literal hazard statement codes (`hazard_statement_codes`, e.g. "H225").
-   Those are run through `H_CODE_TO_PICTOGRAMS`, a fixed Python dict
-   encoding the official UN GHS H-code -> pictogram table. **This mapping
-   is applied in code, not asked of the LLM** -- an earlier version asked
-   the model to do this lookup itself and it missed most codes even with
-   the full table in the prompt; moving it to a deterministic dict fixed
-   that completely (verified: 5/5 H-codes correctly resolved after the
-   change, vs 1/5 before).
+2. **H-code lookup (deterministic)** -- codes from `hazard_statement_codes`
+   (AI-extracted) plus every `hazard_statements[].code` (step 4a) are run
+   through `H_CODE_TO_PICTOGRAMS`, a fixed Python dict encoding the
+   official UN GHS H-code -> pictogram table. **This mapping is applied in
+   code, not asked of the LLM** -- an earlier version asked the model to
+   do this lookup itself and it missed most codes even with the full
+   table in the prompt; moving it to a deterministic dict fixed that
+   completely (verified: 5/5 H-codes correctly resolved after the change,
+   vs 1/5 before).
 3. **Vision icon detection** -- the codes from step 3.
+
+### Step 4a -- `hazard_statements`: anchored on the document's own H-codes
+
+`hazard_statements` (array of `{code, text}`) is **100% non-AI** --
+`regex_extractor.extract_hazard_statements()` produces it, there is no
+`FIELD_PROMPTS` entry for it, and the AI is never asked. The rule is:
+
+> An H-code literally printed in the document is the only thing that can
+> put an entry in this field. No codes printed -> `[]`.
+
+- **Code present** -> entry created. Text prefers the document's own
+  wording next to that code; if the document prints a bare code with no
+  sentence beside it (real pattern: per-ingredient tables, Section 16
+  reference lists), `hazard_statement_lookup.text_for_code()` supplies the
+  official text. That expands a code the document itself asserted.
+- **No codes present** -> `[]`. Some vendors (Fisher Scientific/Acros
+  Organics) print only sentences -- "Highly flammable liquid and vapor" --
+  with no H-code character anywhere on the page. Those yield nothing here.
+  The sentences are not lost: `safety_hazards` still carries them.
+
+**Why no reverse (sentence -> code) lookup, even a deterministic one.**
+An earlier version had both an AI tier and a phrase->code table. The AI
+tier was removed after a confirmed failure: told explicitly not to invent
+a code that wasn't literally present, it still returned
+H225/H319/H335/H336/H373 for a document verified (direct text search) to
+contain zero literal H-code characters -- it recognized the standard GHS
+phrasing from training and filled the codes in from memory. Same failure
+mode as the pictogram H-code lookup above. The phrase->code table was then
+removed too, because deriving a code from wording asserts a classification
+the document never printed, regardless of how the derivation happens.
+
+**Scoping matters.** Extraction is confined to Section 2's hazard-statement
+block. A whole-document scan over-collects: `SILVER NITRATE LRG` lists 4
+codes in Section 2 but contains 6 distinct ones across per-ingredient and
+reference sections. A negative lookbehind also stops `EUH066` matching as
+`H066` -- a real false positive seen on `ACETONE LRG`.
+
+Verified on real documents: 19/20 extraction (the 1 miss is a consumer
+product with genuinely zero hazard statements), Fisher-style documents
+correctly yield `[]`, and unit tests confirm the bare-code, sentences-only,
+and `EUH` cases all behave as described.
 
 ### Step 5 -- Other derived fields (also in `compute_derived_fields`)
 
@@ -306,18 +349,19 @@ vs. one document. What makes it "bulk" is orchestration:
 ## 4. Known limitations (be aware before extending)
 
 - **`SDS-Extraction-Contract.pdf` v2 fields not yet implemented**: structured
-  `hazard_statements`/`precautionary_statements` (paired code+text, deduped),
-  `disposal`, `regulatory_flags` (Prop 65/SARA 313/CERCLA/REACH/TSCA),
-  `language`, and the `status`/`overall_confidence`/`needs_review`/
-  `warnings` response envelope. (`keywords` is implemented -- step 5.)
-  These weren't moved to regex because testing
-  showed real accuracy risk: section-boundary text splitting disagreed with
-  AI extraction on 3 of 9 real documents for free-text fields, and this
-  vendor's documents don't state H-codes as literal text at all (only full
-  sentences), so a regex can't recover them the way it can a date or CAS
-  number. `next_review_due`'s fallback-when-no-cadence-stated policy is also
-  still open -- see the field-gap discussion for the "invent a default vs.
-  flag as needs-review" trade-off.
+  `precautionary_statements` (paired code+text, deduped), `disposal`,
+  `regulatory_flags` (Prop 65/SARA 313/CERCLA/REACH/TSCA), `language`, and
+  the `status`/`overall_confidence`/`needs_review`/`warnings` response
+  envelope. (`keywords` is implemented -- step 5. `hazard_statements` is
+  implemented -- step 4a, including the vendors that only state a
+  hazard-statement sentence with no H-code anywhere on the page.) The
+  fields above remain unimplemented because testing showed real accuracy
+  risk for regex: section-boundary text splitting disagreed with AI
+  extraction on 3 of 9 real documents for free-text fields like
+  `first_aid_measures`/`storage`/`disposal`. `next_review_due`'s
+  fallback-when-no-cadence-stated policy is also still open -- see the
+  field-gap discussion for the "invent a default vs. flag as
+  needs-review" trade-off.
 - **No token/cost cap.** Usage is tracked and shown per-document and per-batch
   (`usage_tracker.py`), but nothing stops a batch before it runs -- the
   only upstream guards against runaway cost are the 60,000-character text
@@ -345,6 +389,7 @@ vs. one document. What makes it "bulk" is orchestration:
 | Add/remove an AI-extracted field | `ai_extractor.FIELDS_SCHEMA` + `FIELD_PROMPTS`, then thread it through `extraction_pipeline.py`'s `compute_derived_fields()`, `bulk_upload.py`'s `_build_bulk_record()`, and `repository.py`'s `SUMMARY_FIELDS` |
 | Add/change a regex-first field | `regex_extractor.py` (new extractor function) + `extraction_pipeline._apply_regex_extraction()` (wire it in) -- also add the same key to `ai_extractor.FIELDS_SCHEMA`/`FIELD_PROMPTS` so it still has an AI fallback for documents the regex misses. Test against real documents before trusting -- see the module docstring's rationale on why some fields (H-codes, free-text safety fields) were deliberately NOT moved here |
 | Change pictogram matching rules | `extraction_pipeline.PICTOGRAM_DEFS` (synonyms) or `extraction_pipeline.H_CODE_TO_PICTOGRAMS` (H-code mapping) |
+| Add/fix an official H-code phrase | `hazard_statement_lookup.H_CODE_TO_TEXT` (add the code+text) and `_SPELLING_VARIANTS` (British/American wording differences) |
 | Change which model is used | `.env` -- `OPENAI_MODEL` (field extraction) / `OPENAI_OCR_MODEL` (vision calls) |
 | Change bulk concurrency | `bulk_upload.MAX_WORKERS` |
 | Change how many pages get scanned for pictograms | `extraction_pipeline.PICTOGRAM_DETECTION_MAX_PAGES`, and the `max_pictogram_pages` param on `ocr.extract_text_and_pictograms()` |

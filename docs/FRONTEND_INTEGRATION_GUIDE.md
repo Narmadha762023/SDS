@@ -65,11 +65,16 @@ Fields marked "regex, AI fallback" are found by pattern matching first
 given document if the pattern isn't found there -- from the caller's side
 this is invisible, the field is populated either way, just sometimes for
 free. This field set follows `SDS-Extraction-Contract.pdf` v2; a few of
-that contract's fields (structured hazard/precautionary statement pairs,
+that contract's fields (structured `precautionary_statements` pairs,
 `disposal`, `regulatory_flags`, `language`, and the
 `status`/`confidence`/`warnings` envelope) aren't implemented yet -- see
 `BACKEND_AI_GUIDE.md` section 4 for why. `keywords` **is** implemented,
 deterministically (no AI) -- see `extraction_pipeline.generate_keywords()`.
+`hazard_statements` **is** implemented and involves **no AI at all**: it is
+anchored on H-codes literally printed in the document, so a document that
+prints no codes returns `[]` rather than codes derived from the wording --
+see `BACKEND_AI_GUIDE.md` step 4a for the confirmed hallucination case that
+drove this rule.
 
 ```json
 {
@@ -94,6 +99,7 @@ deterministically (no AI) -- see `extraction_pipeline.generate_keywords()`.
   "transport": {"un_no": "UN1294", "shipping_name": "TOLUENE", "hazard_class": "3", "packing_group": "II"},
   "rcra_waste_code": "U220",
   "ingredients": [{"name": "Toluene", "cas_number": "108-88-3", "concentration": "<=100%"}],
+  "hazard_statements": [{"code": "H225", "text": "Highly flammable liquid and vapour"}],
   "keywords": ["toluene", "flammable", "irritant", "liquid", "laboratory chemicals"],
   "version": "3.2",
   "revision_date": "2025-03-03",
@@ -135,6 +141,7 @@ deterministically (no AI) -- see `extraction_pipeline.generate_keywords()`.
 | `transport` | object `{un_no, shipping_name, hazard_class, packing_group}` or `{}` | regex (Section 14), AI fallback |
 | `rcra_waste_code` | string | regex (Section 13), AI fallback |
 | `ingredients` | array of `{name, cas_number, concentration}` | regex (Section 3 composition table, one row per line), AI fallback |
+| `hazard_statements` | array of `{code, text}` | regex only, no AI. One entry per H-code literally printed in Section 2; `text` is the document's own wording, or the code's official text when the document prints a bare code. `[]` when the document prints no codes (even if it states hazard sentences -- those remain in `safety_hazards`). |
 | `keywords` | array of strings, 5-15 lowercased tags | deterministic, no AI -- derived from product name/synonyms/pictogram labels/signal word/physical state/recommended use (`extraction_pipeline.generate_keywords()`); powers tag-based filtering, not free-text search |
 | `version` | string | regex (`Revision Number N`), AI fallback, or parsed from filename as last resort |
 | `revision_date` | string, `YYYY-MM-DD` or `""` | regex (`Revision Date ...`), AI fallback, parsed |
@@ -201,6 +208,7 @@ this is also the schema `regex_extractor.py` fills in wherever it can):
     "transport": {},                    # {"un_no": "UN1294", "shipping_name": ..., "hazard_class": ..., "packing_group": ...}
     "rcra_waste_code": "",
     "ingredients": [],                  # [{"name": ..., "cas_number": ..., "concentration": ...}]
+    "hazard_statements": [],            # [{"code": "H225", "text": "Highly flammable liquid and vapour"}]
 }
 ```
 

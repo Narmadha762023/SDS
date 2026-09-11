@@ -168,6 +168,17 @@ def _show_summary(record: dict) -> None:
             for ing in ingredients
         ])
 
+    hazard_statements = record.get("hazard_statements") or []
+    if hazard_statements:
+        st.markdown("**Hazard Statements**")
+        st.table([
+            {
+                "Code": h.get("code") or "—",
+                "Statement": h.get("text", ""),
+            }
+            for h in hazard_statements
+        ])
+
     st.divider()
     stored_name = record.get("stored_document", "")
     doc_path = UPLOADS_DIR / stored_name if stored_name else None
